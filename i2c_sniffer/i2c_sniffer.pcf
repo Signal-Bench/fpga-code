@@ -1,0 +1,16 @@
+# i2c_sniffer pinout for UPduino v3
+# Reuses the same SPI and LED pins as uart_to_spi.v.
+# Assumption: sniff SCL on pin 38 and SDA on pin 42.
+
+set_io -nowarn led_r        41
+set_io -nowarn led_g        39
+set_io -nowarn led_b        40
+
+set_io -nowarn spi_cs_flash 16
+
+set_io -nowarn scl_pin      38
+set_io -nowarn sda_pin      42
+
+set_io -nowarn spi_mosi     21
+set_io -nowarn spi_cs       19
+set_io -nowarn spi_sck      11
