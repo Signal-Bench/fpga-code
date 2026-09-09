@@ -20,5 +20,13 @@ UPduino-v3.0/
 ice40_ultraplus_examples/
 up5k/
 
-# Editor/tool cruft
+# lattice docs
+ice_docs/
+
+# Vendor datasheets and standards -- local-only reference, not redistributable.
+# The ISO 11898-1 copies are institution-licensed and marked no-further-reproduction,
+# and the folder is ~54 MB of PDFs against a few hundred KB of RTL.
+docs/
+
+# Editor / agent scratch
 .codex

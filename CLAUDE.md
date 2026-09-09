@@ -4,12 +4,82 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A capstone project targeting the Lattice iCE40 UP5K FPGA on an UPduino v3 board. The
-active work is `i2c_sniffer/`: an I2C bus sniffer that captures SCL/SDA traffic and
-drains it out over a bit-banged SPI link to a host. The repo also contains several
+A capstone project (**SignalBench**) targeting the Lattice iCE40 UP5K FPGA on an
+UPduino v3 board, paired with an ESP32-H2 MCU and a mobile app over BLE. The active RTL
+work in this repo is `i2c_sniffer/` (complete, hardware-tested) and `can_sniffer/`
+(in progress): bus sniffers that capture traffic and drain it out over a bit-banged
+SPI link to a host. The repo also contains several
 earlier/simpler UART↔SPI bridge designs built along the way (each its own protocol
-analyzer, one per directory), plus two vendored example collections used as reference
-material.
+analyzer, one per directory), plus vendored example collections used as reference
+material. See "Target System Architecture" below for the full planned system this
+repo is building toward — most of it (ESP32 link, trigger subsystem, non-I2C decoders)
+isn't implemented in code yet.
+
+## Target System Architecture (SignalBench)
+
+This section is summarized from the capstone report and describes the *planned* full
+system. Only `i2c_sniffer/` is a complete, hardware-tested piece of it. `can_sniffer/`
+is partially built — the bit timing block is written and simulated, the rest is
+designed but not coded. The ESP32-H2 state-management link, the trigger subsystem, and
+the digital-I/O / RS-232 / RS-485 / SPI decoders below are design targets, not modules
+that exist in this repo yet, unless a note says otherwise. Don't assume code implementing this exists — check
+before referencing it.
+
+Five subsystems: sampling, decoding, trigger, recording, and state management.
+
+- **Sampling** — each GPIO input goes through a 2-stage synchronizer plus a 3rd
+  register for edge detection (rising/falling), matching the pattern already used in
+  `i2c_sniffer.v`. UART, digital I/O, I2C, and SPI probe the target directly via hook
+  probes; CAN, RS-232, and RS-485 go through a line transceiver first for voltage
+  translation to 3.3 V logic.
+- **Decoding** — one decoder per protocol:
+  - *Digital I/O* — simplest decoder: timestamps rising/falling edges on a single pin,
+    for signals that don't conform to any framed protocol.
+  - *UART / RS-232 / RS-485* — one shared decoder (the RS-232/485 variants only differ
+    at the physical layer, before the transceiver output reaches the synchronizer).
+    Detects a start bit (falling edge on an idle-high line), samples the first data bit
+    at 1.5 bit periods in, then every 1 bit period after, and flags framing errors.
+  - *I2C* — matches `i2c_sniffer.v`'s already-implemented behavior: START/STOP via
+    SDA/SCL edge relationships, SDA sampled on SCL rising edges, ACK/NACK tracked on
+    the 9th clock, address byte + R/W bit split into frame metadata, and a sentinel
+    byte inserted on repeated START.
+  - *SPI* — **not yet tested on hardware**, planned only: idle until CS asserted low,
+    sample MOSI/MISO on the configured clock edge, assemble bytes every 8 clocks, end
+    the transaction on CS high.
+- **Trigger** — for buses above 1 MHz, where continuous BLE streaming to the mobile app
+  can't keep up. The MCU writes a hex trigger pattern over SPI; the FPGA compares it
+  against decoder output on a rolling basis, and on a match starts recording payload
+  bytes into the UP5K's 120 Kbit embedded block RAM until the buffer fills or a
+  protocol-defined end condition hits, then sets a recording-done status flag for the
+  MCU to drain.
+- **State management** — SPI link between the FPGA and the **ESP32-H2 MCU**, where
+  **the MCU is SPI master and the FPGA is SPI slave** — the opposite role from the
+  FPGA-as-master pattern used by `uart_to_spi.v` / `host_to_spi.v` / `clock_out.v`
+  elsewhere in this repo. Commands are a single byte, optionally followed by a data
+  byte for parameterized ops (baud rate, trigger pattern). This SPI slave logic is
+  meant to run as its own state machine independent of decode/record, so the MCU can
+  reconfigure the FPGA at any time and it takes effect on the next decoder clock cycle.
+  Write-only config registers: protocol select, baud rate, trigger pattern. Read-only
+  status register: idle / recording-in-progress / streaming-in-progress /
+  active-protocol fields, plus a recording-done flag once a triggered capture
+  finishes. Two operating modes, each entered via a request-then-start-command
+  handshake: **streaming** (decoded frames sent to the MCU as they arrive) and
+  **recording** (trigger-armed capture into EBR, drained after the fact).
+
+The closest existing building block for the state-management SPI-slave role is
+[`spi_slave/spi_slave.v`](spi_slave/spi_slave.v) (write/read queues, MISO shift-out) —
+but its protocol (fixed 32-bit frames, init-opcode handshake) doesn't match the
+single-command-byte design described above, so it'd need adapting rather than reuse
+as-is. The report's "picocom + companion C utility" integration-testing setup already
+corresponds to this repo's `make pico` target and `tools/send_pattern.c`.
+
+[`state_management.md`](state_management.md) works through this SPI command protocol
+in more detail: step-by-step transaction traces for recording (with and without a
+trigger pattern), streaming, and a proposal for loading multi-byte trigger patterns
+given the one-command-byte-plus-one-data-byte format. It's draft/proposal, not spec —
+treat any `CMD_...` name in it as a placeholder, and check its "Open questions"
+section before assuming a detail (opcode values, drain byte format, MOSI vs. MISO
+direction) is settled.
 
 Toolchain: open-source icestorm flow (`yosys`, `nextpnr-ice40`, `icepack`, `icetime`,
 `iceprog`) and `iverilog`/`vvp`/`gtkwave` for simulation. `UPduino-v3.0/`,
@@ -26,16 +96,19 @@ time` in each design directory, don't expect them to be present after a fresh cl
 ```
 common/            shared includes: uart.v, util.v, and the general upduino_v3.pcf
 i2c_sniffer/        primary design — see below
+can_sniffer/        CAN 2.0B sniffer — bit timing done, decoder in progress (see below)
 uart_to_spi/        UART sniffer -> SPI bridge (structural ancestor of i2c_sniffer)
 host_to_spi/        UART-to-host bridge that drives a real SPI *master* transaction
 host_to_fpga/        UART echo + inverted-byte-response demo, used to validate the link
 clock_out/           UART RX -> bit-banged SPI TX bridge (earlier/simpler than uart_to_spi)
 clock_test/          minimal design: divides 48 MHz HFOSC down to ~1 MHz on a pin
+spi_hw_stream/       hard-IP (SB_SPI) SLAVE bring-up test — streams a 500 kHz counter
 spi_slave/           standalone SPI slave register interface, not wired into any top module
 tools/               send_pattern.c — host-side UART test-pattern generator
 ice40_ultraplus_examples/   vendored example collection (own Makefiles/README)
 up5k/                        earlier UPduino v2 icestorm demos (own Makefile)
 UPduino-v3.0/                 vendored board reference repo (gitignored, not pushed)
+docs/               vendor datasheets and standards, local-only (gitignored — see below)
 notes.md            informal hardware-debugging notes (bit order, polarity, known bugs)
 ```
 
@@ -105,6 +178,57 @@ that file. When the two disagree, the `.v` is authoritative.
 known bugs from specific dates) — check it before re-debugging something already
 characterized on hardware.
 
+## CAN sniffer: can_sniffer
+
+Passive CAN 2.0B sniffer, successor to `i2c_sniffer`. **In progress** — only
+`can_bit_timing.v` is written; the frame FSM, CRC-15, record packing and top module are
+specified in `can_sniffer/can_sniffer.md` but not coded, and nothing has been on
+hardware. There is no `build`/`flash` target yet because there is no top module.
+
+All commands run from `can_sniffer/`:
+
+```
+make sim              # iverilog + vvp against can_bit_timing_tb.v
+make wave             # same but dumps can_bit_timing_tb.vcd and opens gtkwave
+make sweep-timing     # oscillator-offset sweep, both worst-case stimulus patterns
+make sweep-segments   # compares candidate bit-time segment configurations
+make clean            # removes sim artifacts only (non-destructive, unlike i2c_sniffer)
+```
+
+### The one thing that makes CAN different from every other design here
+
+**`can_sniffer` must be clocked from the UPduino's 12 MHz on-board oscillator (short
+jumper R16, silkscreen "OSC", arrives on `gpio_20`) — NOT `SB_HFOSC`.** Every other
+design in this repo uses `SB_HFOSC`, which is fine for them because I2C and UART either
+carry a clock or are heavily oversampled. CAN is NRZ with no clock line, so ISO 11898-1
+clause 11.3.2.5 imposes a real accuracy budget: **df < 0.98%** for this configuration,
+while `SB_HFOSC` is spec'd at 48 MHz ±10% commercial / ±20% industrial (Lattice
+FPGA-DS-02008 Table 4.11). It would fail *data-dependently* — some frames decoding and
+some not — which is the expensive kind of hardware bug.
+
+`can_sniffer/clock_choice.md` is the full derivation, written to be self-contained:
+what the bit-time segments and SJW are, the ISO equations, the simulation results, and
+why 12 tq/bit was chosen over PLL-ing to 24 MHz. Read it before touching any timing
+parameter. `can_sniffer/can_sniffer.md` is the design doc for everything else — frame
+format, record layout, which errors a passive sniffer can and cannot detect, LED map,
+transceiver wiring, pin plan.
+
+### Notes that are easy to get wrong
+
+- **Bit stuffing** covers SOF through the CRC *sequence*; the CRC delimiter, ACK field
+  and EOF are fixed-form and not stuffed. **CRC-15** (poly `0x4599`) is computed over
+  the *destuffed* stream from SOF through the end of the *data field* — not including
+  the CRC sequence itself. Two different spans, easy to conflate.
+- Reserved bits `r0`/`r1` must **not** be flagged as form errors — the spec says
+  receivers accept dominant and recessive in all combinations.
+- A **bit error** cannot be detected passively at all; it can only be inferred by
+  elimination and should be reported as "unattributed error".
+- **Overload frames** are not errors (they are flow control) but the FSM still has to
+  parse them, or it loses frame sync.
+- The test bus is a GM6020 motor: 1 Mbit/s, **standard frames only**, DLC 8. Extended
+  (29-bit) frames are supported in the decoder but the bench rig will never exercise
+  them — they need a synthetic testbench.
+
 ## Other protocol analyzers / stepping-stone designs
 
 These predate `i2c_sniffer.v` and were stepping stones toward it (see "What Was Reused"
@@ -123,7 +247,8 @@ icepack <name>.asc <name>.bin
 - `uart_to_spi/` — sniffs two UART lines (TX and RX of a target) and sends `[0x48 header][flag][data]` over SPI. Structural ancestor of `i2c_sniffer.v` (oscillator, SPI state machine, LED pulse-stretcher pattern all reused directly).
 - `host_to_fpga/` — UART echo + inverted-byte-response demo (`"N <data>\n"` protocol), used to validate the UART link itself.
 - `host_to_spi/` — UART-to-host bridge that bit-bangs a real SPI *master* transaction (vs. the sniffers, which only ever drive MOSI) and reports MISO data back over UART.
-- `spi_slave/` — a fuller-featured SPI slave register interface (separate read/write queues); not currently wired into any `top` module in this repo, and has no Makefile of its own.
+- `spi_hw_stream/` — bring-up test for the UP5K's **hardened** SPI block (`SB_SPI`) as a **slave**, the only design here where the FPGA is not the SPI master. Streams a 500 kHz incrementing byte counter through a 64-entry FIFO so a master can verify the link. Has its own `README.md` (wiring, LED meanings, rate math, and the hardware questions it's meant to answer) and a `sim` target whose testbench stubs `SB_SPI` behaviorally — that model is *not* silicon-accurate, so don't treat its passing as proof the real IP behaves the same way.
+- `spi_slave/` — a fuller-featured **soft** SPI slave register interface (separate read/write queues); not currently wired into any `top` module in this repo, and has no Makefile of its own.
 - `common/uart.v` / `common/util.v` — shared building blocks (`uart_tx`/`uart_rx`, `divide_by_n`, `fifo`, `pulse_stretcher`, etc.), pulled in via `` `include "../common/..." `` by nearly every design above.
 
 Pin constraints: `common/upduino_v3.pcf` is the general-purpose UPduino v3 pinout (used
@@ -132,6 +257,19 @@ its own pin assumptions (SCL=38, SDA=42, SPI pins reused from `uart_to_spi.v`). 
 designs explicitly drive the onboard SPI flash chip-select high (`spi_cs = 1` /
 `spi_cs_flash = 1'b1`) since it shares pins with other functions and must be disabled
 to avoid bus contention.
+
+## Reference documents: docs/
+
+`docs/` holds vendor datasheets and standards used during design — Lattice iCE40
+datasheets and technical notes, the Bosch CAN 2.0 spec, ISO 11898-1:2015/2024, the TI
+SN65HVD230 and TCAN330 transceiver datasheets, and the GM6020 manual. It is
+**gitignored and local-only** (~54 MB), for two reasons: the ISO copies are
+institution-licensed and marked "no further reproductions authorized", and vendor PDFs
+do not belong in a repo whose RTL is a few hundred KB. The existing `ice_docs/` ignore
+line reflects the same decision.
+
+Design docs cite these by filename. If a needed document is missing, fetch the official
+version rather than answering hardware questions from memory.
 
 ## Vendored/reference subdirectories
 

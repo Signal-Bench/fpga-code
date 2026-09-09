@@ -1,0 +1,23 @@
+# spi_hw_stream pinout for UPduino v3
+#
+# SCK / MOSI / CS keep the same pins uart_to_spi.v uses, but their
+# DIRECTIONS are reversed: the FPGA is the slave here, so the master drives
+# all three.  MISO is new — a slave needs its own data-out line and cannot
+# share the master's MOSI — so it lands on gpio_13, the same pin
+# host_to_spi.v already uses for MISO.
+#
+# These are the hard SPI IP's pads routed out through general fabric, not
+# the UP5K's dedicated config-SPI pins (14/15/16/17).  That keeps the
+# onboard flash and the FTDI programmer off this bus; pin 16 is still
+# driven high to hold the flash deselected.
+
+set_io -nowarn led_r        41
+set_io -nowarn led_g        39
+set_io -nowarn led_b        40
+
+set_io -nowarn spi_cs_flash 16
+
+set_io -nowarn spi_sck      11
+set_io -nowarn spi_cs       19
+set_io -nowarn spi_mosi     21
+set_io -nowarn spi_miso     13
