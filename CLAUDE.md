@@ -180,20 +180,29 @@ characterized on hardware.
 
 ## CAN sniffer: can_sniffer
 
-Passive CAN 2.0B sniffer, successor to `i2c_sniffer`. **In progress** — only
-`can_bit_timing.v` is written; the frame FSM, CRC-15, record packing and top module are
-specified in `can_sniffer/can_sniffer.md` but not coded, and nothing has been on
-hardware. There is no `build`/`flash` target yet because there is no top module.
+Passive CAN 2.0B sniffer, successor to `i2c_sniffer`. **In progress** — bit timing,
+CRC-15 and the frame decoder are written and pass simulation; record packing, the EBR
+ring, the SPI drain and the top module are specified in `can_sniffer/can_sniffer.md`
+but not coded. Nothing has been on hardware. There is no `build`/`flash` target yet
+because there is no top module.
 
 All commands run from `can_sniffer/`:
 
 ```
-make sim              # iverilog + vvp against can_bit_timing_tb.v
-make wave             # same but dumps can_bit_timing_tb.vcd and opens gtkwave
-make sweep-timing     # oscillator-offset sweep, both worst-case stimulus patterns
-make sweep-segments   # compares candidate bit-time segment configurations
+make sim              # both testbenches
+make sim-timing       # bit recovery only, at the nominal rate
+make sim-frame        # full decode chain, 16 tests
+make synth-check      # yosys resource estimate (no top module to build yet)
+make wave / wave-frame        # as above, dumping VCD and opening gtkwave
+make sweep-timing             # oscillator-offset sweep, both worst-case patterns
+make sweep-segments           # compares candidate bit-time segment configurations
 make clean            # removes sim artifacts only (non-destructive, unlike i2c_sniffer)
 ```
+
+`can_frame_fsm_tb.v` builds real frames from scratch — computing CRC-15 and applying
+bit stuffing independently of the DUT — so it is a genuine cross-check, not a
+round-trip against the same code. The decoder synthesizes at 316 LUT4 + ~271 FF, ~6%
+of the UP5K.
 
 ### The one thing that makes CAN different from every other design here
 

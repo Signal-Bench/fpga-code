@@ -4,9 +4,12 @@ Passive CAN sniffer for the iCE40 UP5K on an UPduino v3, draining decoded frames
 host over bit-banged SPI. Structurally the successor to `i2c_sniffer/`, but the front
 end is entirely different: CAN has no clock line, so the bit clock must be recovered.
 
-**Status as of 2026-09-09:** `can_bit_timing.v` implemented and simulated. The frame
-FSM, CRC, record packing, SPI drain and top module are designed below but **not written
-yet**. Nothing has been on hardware.
+**Status as of 2026-09-10:** bit timing, CRC-15 and the frame decoder are implemented
+and passing simulation (16 tests). Record packing, the EBR ring, the SPI drain and the
+top module are designed below but **not written yet**. Nothing has been on hardware.
+
+The decoder synthesizes for the UP5K at **316 LUT4 + ~271 FF**, roughly 6% of the
+device's 5280 LUTs — `make synth-check`.
 
 ## Target bus
 
@@ -43,9 +46,14 @@ PHASE_SEG2=3`, sample point at 75%, SJW = 4. Other bit rates come from the presc
 | File | Role | Status |
 |---|---|---|
 | `can_bit_timing.v` | tq generator, segment FSM, hard sync + resync, sample point | **done** |
-| `can_crc15.v` | CRC-15 shift register, poly `0x4599` | planned |
-| `can_frame_fsm.v` | field FSM, destuffing, error + overload detection | planned |
+| `can_crc15.v` | CRC-15 shift register, poly `0x4599` | **done** |
+| `can_frame_fsm.v` | field FSM, destuffing, error + overload detection | **done** |
 | `can_sniffer.v` | top: record packing, EBR ring, SPI drain, LEDs | planned |
+
+`can_frame_fsm.v` emits a record on `frame_strobe` with the identifier, IDE/RTR, DLC,
+data (left-justified so `data[0]` is always in `[63:56]`, whatever the DLC), `crc_ok`,
+`ack_ok`, an overload flag and a 3-bit error code. It also drives `bus_idle` back into
+`can_bit_timing.v` to gate hard synchronization.
 
 Split into separate modules rather than one file like `i2c_sniffer.v` specifically so
 the bit timing can have its own sweep testbench — the frequency-offset sweep is the
@@ -271,11 +279,31 @@ scope on RXD when bit-level truth is needed, should be enough. Easy to add later
 ## Testing
 
 ```
-make sim              # bit timing testbench at nominal rate
-make wave             # same, dumps can_bit_timing_tb.vcd and opens gtkwave
-make sweep-timing     # frequency-offset sweep, both stimulus patterns
-make sweep-segments   # compare candidate segment configurations
+make sim              # both testbenches
+make sim-timing       # bit recovery only, nominal rate
+make sim-frame        # full decode chain, 16 tests
+make synth-check      # yosys resource estimate (no top module yet)
+make wave / wave-frame        # as above but dump VCD and open gtkwave
+make sweep-timing             # frequency-offset sweep, both stimulus patterns
+make sweep-segments           # compare candidate segment configurations
 ```
+
+`can_frame_fsm_tb.v` builds real frames from scratch — it computes the CRC-15 and
+applies bit stuffing itself, independently of the DUT — then drives the bit stream onto
+`rx` at 1 Mbit/s. Coverage: standard and extended data frames, standard and extended
+remote frames, DLC 0 and DLC 8, a stuff-heavy payload, and every error path
+(CRC, ACK, stuff, form, unattributed, stuck-dominant) plus an overload frame between two
+data frames.
+
+Two decoder behaviours worth knowing, both verified in simulation:
+
+- A bus that goes dominant from idle produces **two** records — a stuff error first
+  (from idle it is indistinguishable from a SOF followed by a stuffing violation), then
+  the stuck-dominant record once 13 dominant bits have gone by. 13 is deliberately above
+  the 12-bit maximum of a legal error-flag superposition.
+- The overload flag rides on the **next** record, not the one before it: a frame's
+  record is emitted at the last-but-one EOF bit, which is before the overload condition
+  can occur.
 
 The best hardware bring-up test costs nothing: **power the GM6020 with the STM32
 disconnected.** The motor transmits feedback at 1 kHz, nobody ACKs, so it takes an ACK
