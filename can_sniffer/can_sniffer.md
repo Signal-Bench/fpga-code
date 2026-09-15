@@ -322,17 +322,29 @@ Transceiver, identical for the VP230 in hand and the TCAN330GD later:
 One wire from header 23 to transceiver pin 4 is the whole data path. Everything else
 is power and strapping.
 
-**On a VP230 breakout module, check two things before trusting it:**
+**The VP230 breakout in hand carries a 10 kΩ and a 120 Ω.** Datasheet-confirmed
+meaning of each, and what to do:
 
-- **Termination.** Most carry a 120 Ω across CANH/CANL, often hard-soldered (look for
-  a resistor marked `121` or `120` near the terminal block, or a jumper labelled
-  `R`/`TERM`/`120`). **Remove or open it.** The sniffer taps the *middle* of the bus;
-  termination belongs only at the two ends.
-- **RS strapping.** Some modules tie RS to GND through a 10–100 kΩ resistor on the PCB
-  (slope-control mode). Then pin 8 is not reachable and the transceiver is *not* in
-  listen-only mode. That is still safe **as long as TXD is held high** — the driver is
-  enabled but permanently recessive — so the TXD → 3.3 V strap is not optional. It is
-  the fallback that keeps you passive when RS is not available.
+- **10 kΩ, RS (pin 8) to GND** — puts the part in *slope-control* mode
+  (`sn65hvd230.pdf` pin table: "10kΩ to 100kΩ pull down to GND = slope control mode").
+  The driver is **enabled**. Not listen-only. **Fix without desoldering:** wire RS
+  directly to 3.3 V, at pin 8 or at the RS-side pad of the resistor. A hard 3.3 V
+  connection overrides a 10 kΩ pull-down — RS sits at 3.3 V (the resistor sinks a
+  harmless 0.33 mA), above the 0.75·VCC standby threshold, and the driver switches
+  off. Removing the resistor also works; it just isn't required.
+- **120 Ω, across CANH/CANL** — bus termination. **Remove it.** The sniffer taps the
+  middle of the bus; the two ends (GM6020 DIP 4, STM32 transceiver) already
+  terminate. Confirm with a meter: ~120 Ω between CANH and CANL, module unpowered.
+
+**TXD → 3.3 V is mandatory regardless.** The datasheet calls the D pin's internal
+pull-up *weak* and recommends an external 1–10 kΩ pull-up for a dependable recessive
+state; a direct wire is stronger still. Never leave CTX floating. With RS strapped
+high this is belt-and-braces; if RS is left at 10 kΩ, **it is the only thing keeping
+the sniffer passive** — the driver is live, and a floating TXD drifting low would put
+dominant on the bus.
+
+Module header, final: `3V3` → 3.3 V, `GND` → GND, `CTX` → 3.3 V, `CRX` → UPduino
+header 23, plus one added wire RS → 3.3 V, 120 Ω removed.
 
 ### 3. The bus itself
 
