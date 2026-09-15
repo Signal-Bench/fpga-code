@@ -76,8 +76,12 @@ point far enough to corrupt the next several bits. SJW is the trade-off knob:
   the receiver further off.
 - **Smaller SJW** → more robust to glitches, but demands a more accurate clock.
 
-SJW can never exceed PHASE_SEG1 (you cannot shorten a segment below zero), and in
-classical CAN it is conventionally capped at 4. We use **SJW = 4**.
+ISO 11898-1:2015 clause 11.3.1.2 bounds it two ways: **SJW ≤ min(PHASE_SEG1,
+PHASE_SEG2)**, and **PHASE_SEG2 ≥ max(SJW, information processing time)**. The binding
+segment is whichever phase buffer is *shorter* — here that is PHASE_SEG2 = 3, so the
+largest conformant SJW is 3. We use **SJW = 3**. (An earlier revision had SJW = 4,
+which violates both clauses; the RTL saturated safely but was non-conformant. It now
+refuses to simulate with an out-of-range SJW.)
 
 Two more rules bound how often this can happen (ISO 11898-1 clause 11.3.2.1): **at most
 one synchronization per bit time**, and **only on an edge where the previous sample
@@ -108,10 +112,10 @@ long recessive stretch with no usable edge. Drift accumulates unchecked across i
 
 The configuration is **12 MHz core, 12 tq per bit** (so tq = 1 core clock = 83.3 ns,
 bit time = 1 µs = 1 Mbit/s), split `SYNC=1, PROP_SEG=4, PHASE_SEG1=4, PHASE_SEG2=3`,
-sample point at 9/12 = **75%**, SJW = 4:
+sample point at 9/12 = **75%**, SJW = 3:
 
 ```
-(3)   df < 4 / (2 × 10 × 12)           = 4/240 = 1.67%
+(3)   df < 3 / (2 × 10 × 12)           = 3/240 = 1.25%
 (4)   df < min(4,3) / (2 × [13×12 − 3]) = 3/306 = 0.98%   <-- binding
 ```
 
@@ -195,10 +199,10 @@ offsets. Two stimulus patterns:
 
 Measured breaking points on pattern 1:
 
-| Configuration | Sample point | ISO eq. (4) bound | Measured pass range |
-|---|---|---|---|
-| `1/4/4/3` (chosen) | 75% | 0.98% | −1.4% … beyond +6% |
-| `1/3/4/4` | 67% | 1.32% | −2.0% … beyond +6% |
+| Configuration | SJW | Sample point | ISO eq. (4) bound | Measured pass range |
+|---|---|---|---|---|
+| `1/4/4/3` (chosen) | 3 | 75% | 0.98% | −1.4% … beyond +6% |
+| `1/3/4/4` | 4 | 67% | 1.32% | −2.0% … beyond +6% |
 
 Two things to read from this:
 
@@ -207,7 +211,10 @@ Two things to read from this:
    models relative error between one ideal transmitter and us.
 2. **The margin is strongly asymmetric.** A transmitter running *fast* (negative offset,
    shorter bits) breaks us first, because with the sample point at 75% there are only
-   3 tq of PHASE_SEG2 after it but 8 tq before it.
+   3 tq of PHASE_SEG2 after it but 8 tq before it. This is a property of where the
+   sample point sits, not of SJW: the sweep numbers were identical with the earlier
+   non-conformant SJW = 4 and the corrected SJW = 3, because shortening was already
+   bounded by PHASE_SEG2 itself and equation (4) does not take SJW as an input.
 
 Rebalancing to `1/3/4/4` buys ~40% more tolerance, and it was **deliberately not
 taken**. With a crystal the real relative error is around ±100 ppm — 140× inside even

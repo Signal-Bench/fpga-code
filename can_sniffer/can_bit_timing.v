@@ -25,6 +25,13 @@
  * Defaults: 12 MHz core, BRP=0 (tq = 1 clk), 12 tq/bit -> 1 Mbit/s,
  * sample point at 9/12 = 75%.
  *
+ * Parameter constraints (ISO 11898-1:2015 clause 11.3.1.2):
+ *   SJW        <= min(PHASE_SEG1, PHASE_SEG2)
+ *   PHASE_SEG2 >= max(SJW, information processing time)   (IPT here is 1 tq)
+ * With PHASE_SEG2 = 3 the largest conformant SJW is 3.  The resync logic
+ * saturates rather than underflowing if these are violated, but the result is
+ * asymmetric and non-conformant, so the checks below fail simulation early.
+ *
  * Bus polarity: the transceiver's RXD mirrors the bus, so rx_raw is
  * 0 = dominant, 1 = recessive.  Recessive->dominant is a falling edge.
  */
@@ -32,7 +39,7 @@ module can_bit_timing #(
 	parameter integer PROP_SEG   = 4,
 	parameter integer PHASE_SEG1 = 4,
 	parameter integer PHASE_SEG2 = 3,
-	parameter integer SJW        = 4
+	parameter integer SJW        = 3
 )(
 	input  wire       clk,
 	input  wire       rst,
@@ -49,6 +56,21 @@ module can_bit_timing #(
 );
 	localparam integer TSEG1_NOM = PROP_SEG + PHASE_SEG1;
 	localparam integer TSEG2_NOM = PHASE_SEG2;
+	localparam integer IPT       = 1;   // sample-to-decision latency, tq
+
+	// synthesis translate_off
+	initial begin
+		if (SJW > PHASE_SEG1 || SJW > PHASE_SEG2) begin
+			$display("can_bit_timing: SJW=%0d exceeds min(PHASE_SEG1=%0d, PHASE_SEG2=%0d) -- ISO 11898-1 11.3.1.2",
+			         SJW, PHASE_SEG1, PHASE_SEG2);
+			$finish;
+		end
+		if (PHASE_SEG2 < IPT) begin
+			$display("can_bit_timing: PHASE_SEG2=%0d below information processing time %0d", PHASE_SEG2, IPT);
+			$finish;
+		end
+	end
+	// synthesis translate_on
 
 	// ----------------------------------------------------------------
 	// Time quantum generator

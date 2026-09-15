@@ -38,7 +38,7 @@ Full derivation, the ISO equations, what SJW is, and the simulation results are 
 [clock_choice.md](clock_choice.md). Read that before changing any timing parameter.
 
 Configuration: 12 tq per bit at BRP = 0, split `SYNC=1 / PROP_SEG=4 / PHASE_SEG1=4 /
-PHASE_SEG2=3`, sample point at 75%, SJW = 4. Other bit rates come from the prescaler as
+PHASE_SEG2=3`, sample point at 75%, SJW = 3 (the largest ISO 11898-1 clause 11.3.1.2 allows with PHASE_SEG2 = 3). Other bit rates come from the prescaler as
 `1 MHz / (BRP+1)`.
 
 ## Module breakdown

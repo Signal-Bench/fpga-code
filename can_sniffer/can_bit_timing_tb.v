@@ -23,7 +23,7 @@ module can_bit_timing_tb;
 	parameter integer PROP_SEG   = 4;
 	parameter integer PHASE_SEG1 = 4;
 	parameter integer PHASE_SEG2 = 3;
-	parameter integer SJW        = 4;
+	parameter integer SJW        = 3;
 	parameter real    CLK_MHZ    = 12.0;
 
 	localparam integer NBITS       = 120;
