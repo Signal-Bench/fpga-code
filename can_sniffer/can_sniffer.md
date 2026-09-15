@@ -276,6 +276,114 @@ doubling bytes per frame while enabled.
 Deferred for v1. Timestamp + error type + bit position, plus the option of putting a
 scope on RXD when bit-level truth is needed, should be enough. Easy to add later.
 
+## Bench wiring
+
+**Nothing can be flashed yet** — there is no top module, so this is preparation. But
+all of it can be built and checked now, and none of it changes when `can_sniffer.v`
+lands.
+
+The UPduino header has two numberings that are easy to confuse: the **FPGA pin** (what
+goes in the `.pcf`) and the **header position** (where the wire physically goes). The
+table below gives both; the map is `UPduino-v3.0/docs/source/features/specs.rst`.
+
+### 1. UPduino — one jumper first
+
+**Short R16**, marked **"OSC"** on the silkscreen, next to the oscillator. This routes
+the on-board 12 MHz into FPGA pin 20. Without it the design has no clock and does
+nothing at all — this is the single most likely "it doesn't work" cause on first
+power-up. Once shorted, **do not connect anything to header position 44** (`gpio_20`);
+it is now driven by the oscillator.
+
+Do not take the clock from header position 41 instead: it works, but the v3.0
+silkscreen has positions 41 (12 MHz) and 42 (GND) **swapped**, and a signal wire to
+the wrong one shorts the oscillator output to ground.
+
+### 2. UPduino ↔ transceiver
+
+| Signal | FPGA pin (`.pcf`) | Header position | Transceiver pin |
+|---|---|---|---|
+| `can_rx` | 38 | **23** (left, 13th from top) | 4 — RXD / R |
+| 3.3 V | — | **9** (left) | 3 — VCC, and pins 1 and 8 |
+| GND | — | **10** (left) or **42** (right) | 2 — GND |
+
+Transceiver, identical for the VP230 in hand and the TCAN330GD later:
+
+| Pin | Name | Connect to | Why |
+|---|---|---|---|
+| 1 | TXD / D | **3.3 V** | recessive; never let the FPGA drive this |
+| 2 | GND | GND | |
+| 3 | VCC | **3.3 V**, not 5 V | both are 3.3 V parts; 5 V damages the VP230 |
+| 4 | RXD / R | UPduino header **23** | the entire sniffer input |
+| 5 | Vref / SHDN | **leave open** | VP230: reference output, unused. TCAN330: SHDN, NC = normal |
+| 6 | CANL | CAN_L | GM6020 cable **B, black** |
+| 7 | CANH | CAN_H | GM6020 cable **A, red** |
+| 8 | RS / S | **3.3 V** | VP230: standby = listen-only. TCAN330: silent = receive-only |
+
+One wire from header 23 to transceiver pin 4 is the whole data path. Everything else
+is power and strapping.
+
+**On a VP230 breakout module, check two things before trusting it:**
+
+- **Termination.** Most carry a 120 Ω across CANH/CANL, often hard-soldered (look for
+  a resistor marked `121` or `120` near the terminal block, or a jumper labelled
+  `R`/`TERM`/`120`). **Remove or open it.** The sniffer taps the *middle* of the bus;
+  termination belongs only at the two ends.
+- **RS strapping.** Some modules tie RS to GND through a 10–100 kΩ resistor on the PCB
+  (slope-control mode). Then pin 8 is not reachable and the transceiver is *not* in
+  listen-only mode. That is still safe **as long as TXD is held high** — the driver is
+  enabled but permanently recessive — so the TXD → 3.3 V strap is not optional. It is
+  the fallback that keeps you passive when RS is not available.
+
+### 3. The bus itself
+
+Three nodes on a short twisted pair: **STM32 ↔ sniffer ↔ GM6020**, sniffer in the
+middle, both ends terminated, sniffer not.
+
+```
+  STM32 + transceiver          UPduino + VP230             GM6020
+  [ 120 Ω ]  ───CAN_H────────────┬────────────CAN_H───  [ DIP 4 ON ]
+             ───CAN_L────────────┴────────────CAN_L───
+                              (no terminator)
+                                  │
+                               GND ─── common to all three
+```
+
+- **GM6020 end:** DIP switch **4 ON** enables its internal 120 Ω. Set DIP 1–3 for the
+  motor ID (ID 1 = `001` → feedback on `0x205`). Power it from 24 V on the XT30.
+- **STM32 end:** its transceiver board needs its own 120 Ω. Many STM32 CAN breakouts
+  have one on board; if not, add one across CANH/CANL at that end.
+- **Common ground** between the UPduino, the VP230, the STM32 board and the GM6020's
+  CAN ground. A CAN transceiver tolerates a few volts of common-mode offset but not a
+  floating ground.
+- Keep the stubs to the sniffer short — a few cm. At 1 Mbit/s a long unterminated stub
+  reflects.
+
+### 4. Validation outputs (planned pins, from the pin plan above)
+
+Once the top module exists, the SPI drain goes to a logic analyzer:
+
+| Signal | FPGA pin | Header position |
+|---|---|---|
+| `spi_sck` | 11 | **35** (right) |
+| `spi_cs` | 19 | **37** (right) |
+| `spi_mosi` | 21 | **39** (right) |
+| GND | — | **42** (right) |
+
+Same pins as `i2c_sniffer`, so an existing analyzer setup carries over. A scope
+channel on transceiver pin 4 (RXD) alongside is the way to settle any "is it the bus
+or the decoder" question — that pin is the ground truth the FPGA sees.
+
+### 5. First power-up order
+
+1. Jumper R16. Verify with a scope on header 41 that 12 MHz is present.
+2. Wire the transceiver, power it at 3.3 V, **nothing on the bus yet**. RXD should sit
+   high (recessive) — if it is low, the transceiver is in the wrong mode or CANH/CANL
+   are shorted.
+3. Connect the GM6020 alone, powered, STM32 disconnected. RXD should now show 1 kHz
+   bursts. This is the no-ACK scenario from the Testing section — the sniffer should
+   report `0x205` with ACK error once it exists.
+4. Add the STM32. ACK errors stop; both `0x1FF` commands and `0x205` feedback appear.
+
 ## Testing
 
 ```
