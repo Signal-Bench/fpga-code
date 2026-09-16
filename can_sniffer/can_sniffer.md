@@ -314,6 +314,20 @@ the wrong one shorts the oscillator output to ground.
 > BoM — they are trace jumpers and bare pads. So `VIO` is floating by default and
 > meters as an arbitrary value (~2.3 V is typical leakage). Bank 1 is hardwired to
 > 3.3 V and cannot be changed. Position 8 is +5 V; positions 1, 10 and 42 are GND.
+>
+> If the UPduino's 3.3 V is unavailable or you would rather not load its LDO, the
+> Development Board Type C can supply it instead: its **Customizable I/O Port** (8-pin
+> ejector header, 2.54 mm pitch, manual p10) has **pin 4 = 3.3 V** and **pin 2 = GND**.
+> That port defaults to 3.3 V — the 5 V option needs R210 fitted and R209 removed, a
+> manual rework — but meter it first. Powering the transceiver from there does **not**
+> remove the need to tie UPduino ground to that same ground: `can_rx` is a logic signal
+> and must share the FPGA's reference. Note the manual describes that rail as "mainly
+> used for the onboard device power supply" and gives it no external current budget,
+> unlike 5 V @ 1 A — fine for a transceiver, not for anything larger.
+>
+> Quick health check on the UPduino rail: 3.3 V powers the FT232H, so if the board
+> enumerates over USB (`lsusb` shows `0403:6014`, and `iceprog -t` reads a flash ID)
+> the rail is good and a low reading is a measurement problem, not a board problem.
 
 Transceiver, identical for the VP230 in hand and the TCAN330GD later:
 
