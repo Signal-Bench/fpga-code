@@ -323,7 +323,7 @@ One wire from header 23 to transceiver pin 4 is the whole data path. Everything 
 is power and strapping.
 
 **The VP230 breakout in hand carries a 10 kΩ and a 120 Ω.** Datasheet-confirmed
-meaning of each, and what to do:
+meaning of each:
 
 - **10 kΩ, RS (pin 8) to GND** — puts the part in *slope-control* mode
   (`sn65hvd230.pdf` pin table: "10kΩ to 100kΩ pull down to GND = slope control mode").
@@ -332,9 +332,9 @@ meaning of each, and what to do:
   connection overrides a 10 kΩ pull-down — RS sits at 3.3 V (the resistor sinks a
   harmless 0.33 mA), above the 0.75·VCC standby threshold, and the driver switches
   off. Removing the resistor also works; it just isn't required.
-- **120 Ω, across CANH/CANL** — bus termination. **Remove it.** The sniffer taps the
-  middle of the bus; the two ends (GM6020 DIP 4, STM32 transceiver) already
-  terminate. Confirm with a meter: ~120 Ω between CANH and CANL, module unpowered.
+- **120 Ω, across CANH/CANL** — bus termination. **Keep it.** See the topology below:
+  the Development Board Type C appears to carry no terminator of its own, so the
+  sniffer is the natural thing to terminate that end of the bus with.
 
 **TXD → 3.3 V is mandatory regardless.** The datasheet calls the D pin's internal
 pull-up *weak* and recommends an external 1–10 kΩ pull-up for a dependable recessive
@@ -344,31 +344,58 @@ the sniffer passive** — the driver is live, and a floating TXD drifting low wo
 dominant on the bus.
 
 Module header, final: `3V3` → 3.3 V, `GND` → GND, `CTX` → 3.3 V, `CRX` → UPduino
-header 23, plus one added wire RS → 3.3 V, 120 Ω removed.
+header 23, plus one added wire RS → 3.3 V. The 120 Ω stays.
 
-### 3. The bus itself
+### 3. The bus itself — who terminates what
 
-Three nodes on a short twisted pair: **STM32 ↔ sniffer ↔ GM6020**, sniffer in the
-middle, both ends terminated, sniffer not.
+A CAN bus wants **120 Ω at each of its two ends** and nothing in between. On this
+bench the three nodes are the RoboMaster **Development Board Type C**, the sniffer,
+and the **GM6020**. Where their terminators are decides the layout.
+
+- **GM6020 — has a switchable terminator.** `RM GM6020 使用说明（英）20231103.pdf` p5:
+  the DIP block is silkscreened **"CAN RESISTOR"**, switches 1–3 set the motor ID and
+  **switch 4 controls CAN terminal resistance — ON enables it**. Note ID `000` is
+  listed as *Invalid*, so at least one of 1–3 must be ON; `001` = ID 1 = feedback on
+  `0x205`, control on `0x1FF`.
+- **Development Board Type C — appears to have none.** Its manual (p11–12) shows all
+  four CAN connectors — J23/J22 for CAN1, J21/J20 for CAN2 — and **no termination
+  resistor or jumper anywhere on them**. The only `120.0R` in the whole document is
+  R13, the IMU heater, on an unrelated page. The transceiver is a TJA1044 and the bus
+  is rated to 1 Mbit/s. The giveaway is that **each CAN bus is wired to two connectors
+  in parallel**: that is a pass-through design, meant to sit mid-chain with the end
+  devices terminating.
+- **Sniffer — has a 120 Ω** on the breakout, as shipped.
+
+So the board's dual connectors give the ideal layout for free, with **no resistor
+removal at all**:
 
 ```
-  STM32 + transceiver          UPduino + VP230             GM6020
-  [ 120 Ω ]  ───CAN_H────────────┬────────────CAN_H───  [ DIP 4 ON ]
-             ───CAN_L────────────┴────────────CAN_L───
-                              (no terminator)
-                                  │
-                               GND ─── common to all three
+   GM6020                Dev Board Type C              sniffer
+ [DIP 4 = ON]          (no terminator, mid-bus)     [VP230 120 Ω kept]
+   120 Ω  ──── CAN_H ──── J23 ╪ J22 ──── CAN_H ────  120 Ω
+          ──── CAN_L ────     ╪     ──── CAN_L ────
+   end of bus          two connectors, same net        end of bus
 ```
 
-- **GM6020 end:** DIP switch **4 ON** enables its internal 120 Ω. Set DIP 1–3 for the
-  motor ID (ID 1 = `001` → feedback on `0x205`). Power it from 24 V on the XT30.
-- **STM32 end:** its transceiver board needs its own 120 Ω. Many STM32 CAN breakouts
-  have one on board; if not, add one across CANH/CANL at that end.
-- **Common ground** between the UPduino, the VP230, the STM32 board and the GM6020's
-  CAN ground. A CAN transceiver tolerates a few volts of common-mode offset but not a
-  floating ground.
-- Keep the stubs to the sniffer short — a few cm. At 1 Mbit/s a long unterminated stub
-  reflects.
+Motor into one CAN1 connector, sniffer into the other, Dev Board in the middle. Both
+ends terminated, nothing stubbed off, ~60 Ω across the pair.
+
+**Confirm with a meter before trusting the manual.** A user manual not showing a
+resistor is not proof the PCB lacks one. Unpowered and unplugged, measure CANH to
+CANL: ~120 Ω means it is terminated, open/high means it is not. Do the same on the
+VP230 module (expect ~120 Ω) and on the GM6020 with DIP 4 ON and OFF. If the Dev Board
+*does* turn out to be terminated, then remove the VP230's 120 Ω after all and hang the
+sniffer off J22 as a short stub instead.
+
+**Grounds.** `CAN1` is a 2-pin port — **CANL, CANH, and no ground**. If the sniffer
+goes on CAN1, run a separate ground wire from the Dev Board to the UPduino/VP230
+ground; a CAN transceiver tolerates a few volts of common-mode offset but not a
+floating reference. `CAN2` is 4-pin (1: 5 V, 2: GND, 3: CANH, 4: CANL) and carries
+ground in the connector, which avoids the extra wire — but the GM6020's own cable is
+2-pin, so CAN1 is the natural bus for the motor. Keep the motor and the sniffer on the
+*same* bus either way.
+
+Power the GM6020 from 24 V on its XT30.
 
 ### 4. Validation outputs (planned pins, from the pin plan above)
 
