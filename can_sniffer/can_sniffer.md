@@ -278,9 +278,24 @@ scope on RXD when bit-level truth is needed, should be enough. Easy to add later
 
 ## Bench wiring
 
-**Nothing can be flashed yet** — there is no top module, so this is preparation. But
-all of it can be built and checked now, and none of it changes when `can_sniffer.v`
-lands.
+There is now a bitstream to flash: `can_bringup.v` (`make build && make flash`). It is
+clock + pin + decoder + LEDs only — no SPI drain, no capture RAM, no record packing.
+Its job is to answer on hardware how far the chain gets. 533 LCs (10% of the UP5K),
+timing closes at 20.6 MHz against the 12 MHz constraint.
+
+LED map — the RGB is one physical part, so these mix:
+
+| What you see | Means |
+|---|---|
+| dark | no power, or not configured |
+| **blue blinking only** (~1.4 Hz) | clocked — R16/OSC jumper is good — but no edges on `can_rx` |
+| **blue + red** | edges arriving at the FPGA pin, but nothing decodes |
+| **blue + red + green** | frames decoding cleanly — a 1 kHz GM6020 stream looks white-ish |
+| blue + red, no green | frames arriving but erroring |
+
+Red is deliberately driven from *raw pin edges*, independent of the decoder, so a
+wiring fault can be told apart from a decode fault. `dbg_frame` (FPGA pin 21, header
+39) pulses ~1 µs on every decoded record — a scope trigger.
 
 The UPduino header has two numberings that are easy to confuse: the **FPGA pin** (what
 goes in the `.pcf`) and the **header position** (where the wire physically goes). The

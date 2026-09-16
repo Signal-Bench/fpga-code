@@ -1,0 +1,20 @@
+# can_sniffer / can_bringup pinout for UPduino v3
+#
+# clk_12 REQUIRES jumper R16 ("OSC" on the silkscreen) to be shorted -- that is
+# what routes the on-board 12 MHz oscillator to gpio_20.  Without it there is no
+# clock and the design does nothing.  See clock_choice.md.
+#
+# Numbers below are FPGA pins (what the .pcf wants), not header positions.
+#   clk_12 20 -> header 44 (do not connect anything there once OSC is shorted)
+#   can_rx 38 -> header 23
+
+set_io -nowarn clk_12       20
+set_io -nowarn can_rx       38
+
+set_io -nowarn led_r        41
+set_io -nowarn led_g        39
+set_io -nowarn led_b        40
+
+set_io -nowarn dbg_frame    21
+
+set_io -nowarn spi_cs_flash 16

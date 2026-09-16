@@ -10,7 +10,22 @@
 bt_tb        = can_bit_timing_tb
 fr_tb        = can_frame_fsm_tb
 rtl          = can_crc15.v can_frame_fsm.v can_bit_timing.v
+top_module   = can_bringup
+pcf_file     = can_sniffer.pcf
 pnr_freq_mhz = 12
+
+# Bring-up bitstream: clock + pin + decoder + LEDs, no SPI drain yet.
+build:
+	yosys -p "synth_ice40 -top $(top_module) -json $(top_module).json" $(rtl) $(top_module).v
+	nextpnr-ice40 --up5k --package sg48 --json $(top_module).json --pcf $(pcf_file) --asc $(top_module).asc --freq $(pnr_freq_mhz)
+	icepack $(top_module).asc $(top_module).bin
+
+flash:
+	iceprog -d i:0x0403:0x6014 $(top_module).bin
+
+time: $(top_module).asc
+	icetime -d up5k -c $(pnr_freq_mhz) -mtr timing.rpt $(top_module).asc
+	@echo "Timing report written to timing.rpt. Check PASS/FAIL at the bottom."
 
 sim: sim-timing sim-frame
 
@@ -62,4 +77,4 @@ sweep-segments:
 	done
 
 clean:
-	rm -rf $(bt_tb).out $(fr_tb).out can_bit_timing_tb.vcd can_frame_fsm_tb.vcd
+	rm -rf $(top_module).json $(top_module).asc $(top_module).bin timing.rpt $(bt_tb).out $(fr_tb).out can_bit_timing_tb.vcd can_frame_fsm_tb.vcd
