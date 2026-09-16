@@ -4,15 +4,44 @@ Passive CAN sniffer for the iCE40 UP5K on an UPduino v3, draining decoded frames
 host over bit-banged SPI. Structurally the successor to `i2c_sniffer/`, but the front
 end is entirely different: CAN has no clock line, so the bit clock must be recovered.
 
-**Status as of 2026-09-16: complete and hardware-tested.** The full chain — bit timing,
-CRC-15, frame decoder, record packer, EBR ring and 6 MHz SPI drain — decodes a live
-GM6020 ↔ Development Board Type C bus at 1 Mbit/s, with records verified on a Keysight
-MSOX3024T logic analyzer against the CAN waveform: `AA`/`55` framing lands where
-expected, IDs and payloads match, timestamps advance, and the no-ACK case reports
-`err=4, ack_ok=0, crc_ok=1` as designed.
+**Status as of 2026-09-16: complete; the happy path and the no-ACK path are
+hardware-verified, everything else is simulation only** — see "Hardware verification
+scope" below before claiming more. The full chain — bit timing, CRC-15, frame decoder,
+record packer, EBR ring and 6 MHz SPI drain — decodes the live GM6020 ↔ Development
+Board Type C bus at 1 Mbit/s, with records read on a Keysight MSOX3024T logic analyzer
+against the CAN waveform.
 
 Full top: **1292 LCs (24% of the UP5K), 1 EBR**, timing closes at ~21.8 MHz against the
 12 MHz constraint. `make build && make flash`.
+
+### Hardware verification scope
+
+Be precise about what "hardware-tested" means here. **Verified on the bench
+(2026-09-16), GM6020 + Development Board Type C at 1 Mbit/s:**
+
+- Standard (11-bit) **data frames, DLC 8** — the only frame shape this bus produces
+- Bus operating normally: Dev Board commanding, motor acknowledging — records read
+  correctly on an MSOX3024T logic analyzer (`AA`/`55` framing, ID, payload, timestamp)
+- Dev Board disconnected from the bus, motor still transmitting — records still
+  produced with nobody acknowledging (the `ERR_ACK` path)
+- 6 MHz SPI drain, and the bring-up LED progression
+
+**Simulation only — never exercised on hardware:**
+
+- Extended (29-bit) frames, remote frames, any DLC other than 8
+- Stuff, CRC, form, unattributed and stuck-dominant error paths
+- Overload frames
+- Buffer-full behaviour and the `dropped` flag
+- Any bit rate other than 1 Mbit/s (`BRP` ≠ 0)
+- Resynchronization under real oscillator drift — the tolerance sweep is a simulation;
+  on the crystal the margin is ~200× so it is unlikely to matter, but it has not been
+  measured
+
+The bench bus cannot produce most of the second list. Exercising those paths on
+hardware needs a CAN node that can be made to misbehave — a second MCU with a CAN
+peripheral in loopback or error-injection mode, or a scope's arbitrary waveform output
+driving a transceiver's TXD.
+
 
 ## Target bus
 

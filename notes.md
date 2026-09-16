@@ -42,3 +42,15 @@ Notes from Sept 16 (CAN sniffer bring-up):
 - Dev Board Type C has no CAN termination on any of its 4 connectors, and wires each
   bus to two parallel connectors (pass-through). GM6020 DIP 4 = terminator, DIP 1-3 =
   ID with 000 invalid.
+
+Verification scope for the CAN sniffer, Sept 16 - what was actually seen on hardware:
+- Standard 11-bit data frames, DLC 8, 1 Mbit/s, GM6020 + Dev Board Type C.
+- Bus running normally (MCU commanding, motor ACKing): SPI records correct on the
+  MSOX3024T - AA/55 framing, ID, payload, timestamp bytes.
+- MCU disconnected from the bus, motor still sending: records still produced with
+  no acknowledger (ERR_ACK path).
+- 6 MHz SPI drain; bring-up LED progression.
+NOT seen on hardware, simulation only: extended/remote frames, DLC != 8, stuff/CRC/
+form/unattributed/stuck-dominant errors, overload frames, buffer full / dropped flag,
+any rate other than 1 Mbit/s, resync under real oscillator drift. The bench bus can't
+produce these; they need a node that can be made to misbehave.

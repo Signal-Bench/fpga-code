@@ -6,9 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A capstone project (**SignalBench**) targeting the Lattice iCE40 UP5K FPGA on an
 UPduino v3 board, paired with an ESP32-H2 MCU and a mobile app over BLE. The active RTL
-work in this repo is `i2c_sniffer/` and `can_sniffer/`, both complete and
-hardware-tested: bus sniffers that capture traffic and drain it out over a bit-banged
-SPI link to a host. The repo also contains several
+work in this repo is `i2c_sniffer/` and `can_sniffer/`, both complete and tested on
+hardware against their bench buses: bus sniffers that capture traffic and drain it out
+over a bit-banged SPI link to a host. The repo also contains several
 earlier/simpler UART↔SPI bridge designs built along the way (each its own protocol
 analyzer, one per directory), plus vendored example collections used as reference
 material. See "Target System Architecture" below for the full planned system this
@@ -18,8 +18,10 @@ isn't implemented in code yet.
 ## Target System Architecture (SignalBench)
 
 This section is summarized from the capstone report and describes the *planned* full
-system. `i2c_sniffer/` and `can_sniffer/` are complete, hardware-tested pieces of it
-(both decoders verified against real buses, both draining records over SPI). The
+system. `i2c_sniffer/` and `can_sniffer/` are complete pieces of it, each verified on
+hardware against its bench bus and draining records over SPI — though for CAN only the
+normal-traffic and no-acknowledge cases have been seen on real hardware; the error
+paths are simulation-only (see the CAN section). The
 ESP32-H2 state-management link, the trigger subsystem, and the digital-I/O / RS-232 /
 RS-485 / SPI decoders below are design targets, not modules that exist in this repo
 yet, unless a note says otherwise. Don't assume code implementing this exists — check
@@ -180,12 +182,20 @@ characterized on hardware.
 
 ## CAN sniffer: can_sniffer
 
-Passive CAN 2.0B sniffer, successor to `i2c_sniffer`. **Complete and hardware-tested**
-(2026-09-16) against a RoboMaster GM6020 motor driven by a Development Board Type C at
-1 Mbit/s: bit timing, CRC-15, frame decoder, 20-byte record packer, 16-record EBR ring,
-and a 6 MHz bit-banged SPI master drain, with records verified on a logic analyzer
-against the CAN waveform. 1292 LCs (24% of the UP5K), one EBR, timing closes at
+Passive CAN 2.0B sniffer, successor to `i2c_sniffer`. **Complete** (2026-09-16): bit
+timing, CRC-15, frame decoder, 20-byte record packer, 16-record EBR ring, and a 6 MHz
+bit-banged SPI master drain. 1292 LCs (24% of the UP5K), one EBR, timing closes at
 ~21.8 MHz against the 12 MHz constraint.
+
+**What "hardware-tested" means here, exactly:** verified on a RoboMaster GM6020 driven
+by a Development Board Type C at 1 Mbit/s — standard 11-bit data frames, DLC 8, with
+the bus running normally (frames acknowledged) and with the Dev Board disconnected
+(frames unacknowledged, the `ERR_ACK` path) — records read on a logic analyzer against
+the CAN waveform. **Everything else is simulation only:** extended and remote frames,
+other DLCs, the stuff/CRC/form/unattributed/stuck-dominant error paths, overload
+frames, buffer-full/`dropped`, and any bit rate other than 1 Mbit/s. The bench bus
+cannot produce those; don't describe them as hardware-verified. Full list in
+`can_sniffer/can_sniffer.md` under "Hardware verification scope".
 
 All commands run from `can_sniffer/`:
 
