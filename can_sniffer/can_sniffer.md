@@ -306,6 +306,15 @@ the wrong one shorts the oscillator output to ground.
 | 3.3 V | — | **9** (left) | 3 — VCC, and pins 1 and 8 |
 | GND | — | **10** (left) or **42** (right) | 2 — GND |
 
+> **Take 3.3 V from header position 9, not position 2.** Position 2 is labelled `VIO`
+> and is *not* a supply — it is the bank I/O voltage **input**. Per
+> `UPduino-v3.0/docs/source/tutorials/bank_voltages.rst` and the board schematic, each
+> bank's VCCIO reaches either `+3.3V` (through R31 / R20, shorted on the board) or the
+> `VIO` net (through R19 / R26, which are **open**). None of those four appear in the
+> BoM — they are trace jumpers and bare pads. So `VIO` is floating by default and
+> meters as an arbitrary value (~2.3 V is typical leakage). Bank 1 is hardwired to
+> 3.3 V and cannot be changed. Position 8 is +5 V; positions 1, 10 and 42 are GND.
+
 Transceiver, identical for the VP230 in hand and the TCAN330GD later:
 
 | Pin | Name | Connect to | Why |
