@@ -161,11 +161,22 @@ no-ACK frame comes back with `err=4`, `ack_ok=0` and `crc_ok=1`, which correctly
 the frame was intact and merely unacknowledged.
 
 Buffering is one EBR as **16 records × 32 bytes** (only 20 used; the power-of-two stride
-turns addressing into a concatenation instead of a multiply). At ~2000 frames/s that is
-~8 ms of burst tolerance against a 160 µs drain.
+turns addressing into a concatenation instead of a multiply) — burst tolerance on top of
+a drain that already keeps up.
 
-At ~2000 frames/s that is 40 KB/s against 125 KB/s available at the existing 1 MHz SPI
-drain, so ~3× headroom and no need to raise the SPI clock for v1.
+SCK is not continuous: each byte costs 19 ticks rather than 16, because the EBR read
+takes a cycle to issue, a cycle to land, and a cycle to latch. SCK sits low ~250 ns
+between bytes with CS still asserted. That is ordinary SPI and analyzers decode it
+normally — they count clock edges, not time. The settle cycle was a latent bug: at
+1 MHz the six-clock tick hid a missing wait state, and at 6 MHz every byte came out
+lagged by one.
+
+The drain runs at **6 MHz SCK** — the ceiling from a 12 MHz clock, since the divider
+can only halve. A record takes ~32 µs, and the shortest possible 1 Mbit/s CAN frame
+(DLC 0, worst-case stuffing) is ~57 µs, so **the drain keeps up with a fully saturated
+bus**. At the original 1 MHz a record took 160 µs and could not. 10 MHz is not
+reachable without a PLL, and the core clocks that would allow it (20/40/60 MHz) are
+at or beyond this design's timing closure (~21 MHz).
 
 ### Timestamps
 

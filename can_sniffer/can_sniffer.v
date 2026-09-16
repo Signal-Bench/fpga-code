@@ -26,12 +26,23 @@
  * edge of bus_idle, which is the SOF that hard-synchronized the bit timing.
  *
  * Buffer: one EBR as 16 records x 32 bytes (only 20 used, but the power-of-two
- * stride makes addressing a concatenation instead of a multiply).  At the
- * bench bus rate of ~2000 frames/s that is ~8 ms of burst tolerance against a
- * 160 us drain, so the SPI side has roughly 3x headroom.
+ * stride makes addressing a concatenation instead of a multiply).
+ *
+ * At 6 MHz SCK a record drains in ~32 us.  The shortest possible CAN frame at
+ * 1 Mbit/s (DLC 0, worst-case stuffing) is ~57 us, so the drain keeps up with
+ * a fully saturated bus -- which it could not at 1 MHz, where a record took
+ * 160 us.  The 16-record buffer is burst tolerance on top of that.
+ *
+ * SCK is not continuous: each byte costs 19 ticks, not 16, because the EBR
+ * read takes a cycle to issue, a cycle to land, and a cycle to latch.  That
+ * leaves SCK low for ~250 ns between bytes with CS still asserted, which is
+ * ordinary SPI and decodes normally -- analyzers count clock edges, not time.
  */
 module can_sniffer #(
-	parameter integer SPI_HALF_DIV = 6   // 12 MHz / (2*6) = 1 MHz SCK
+	// SCK = clk_12 / (2 * SPI_HALF_DIV).  1 -> 6 MHz (the ceiling, since the
+	// divider can only halve), 2 -> 3 MHz, 6 -> 1 MHz.  10 MHz is not
+	// reachable from a 12 MHz clock by division and would need a PLL.
+	parameter integer SPI_HALF_DIV = 1
 )(
 	input  wire clk_12,
 	input  wire can_rx,
@@ -218,11 +229,12 @@ module can_sniffer #(
 	wire      tick    = (spi_div == SPI_HALF_DIV[3:0] - 4'd1);
 	always @(posedge clk_12) spi_div <= tick ? 4'd0 : spi_div + 4'd1;
 
-	localparam [2:0] S_IDLE = 3'd0;
-	localparam [2:0] S_LOAD = 3'd1;
-	localparam [2:0] S_WAIT = 3'd2;
-	localparam [2:0] S_SHIFT= 3'd3;
-	localparam [2:0] S_DONE = 3'd4;
+	localparam [2:0] S_IDLE   = 3'd0;
+	localparam [2:0] S_LOAD   = 3'd1;   // issue the EBR read
+	localparam [2:0] S_SETTLE = 3'd2;   // read lands in ram_rd this cycle
+	localparam [2:0] S_WAIT   = 3'd3;   // ram_rd valid: latch, drop CS
+	localparam [2:0] S_SHIFT  = 3'd4;
+	localparam [2:0] S_DONE   = 3'd5;
 
 	reg [2:0] sst       = S_IDLE;
 	reg [4:0] dr_byte   = 5'd0;
@@ -255,8 +267,15 @@ module can_sniffer #(
 				S_LOAD: begin
 					ram_ra <= {rec_rd, dr_byte};
 					ram_re <= 1'b1;
-					sst    <= S_WAIT;      // one cycle for the EBR read
+					sst    <= S_SETTLE;
 				end
+
+				// ram_re is registered, so the EBR performs the read on the
+				// cycle after S_LOAD and ram_rd is only valid the cycle after
+				// that.  With SPI_HALF_DIV = 1 the FSM advances every clock,
+				// so without this state S_WAIT would latch the previous byte.
+				// (At the old 1 MHz setting the six-clock tick hid the bug.)
+				S_SETTLE: sst <= S_WAIT;
 
 				S_WAIT: begin
 					dr_sr  <= ram_rd;
