@@ -340,34 +340,84 @@ Transceiver, identical for the VP230 in hand and the TCAN330GD later:
 | 5 | Vref / SHDN | **leave open** | VP230: reference output, unused. TCAN330: SHDN, NC = normal |
 | 6 | CANL | CAN_L | GM6020 cable **B, black** |
 | 7 | CANH | CAN_H | GM6020 cable **A, red** |
-| 8 | RS / S | **3.3 V** | VP230: standby = listen-only. TCAN330: silent = receive-only |
+| 8 | RS / S | **VP230: leave on its 10 kΩ to GND.** TCAN330: 3.3 V | see the hardware result below — VP230 standby does *not* receive at 1 Mbit/s |
 
 One wire from header 23 to transceiver pin 4 is the whole data path. Everything else
 is power and strapping.
 
-**The VP230 breakout in hand carries a 10 kΩ and a 120 Ω.** Datasheet-confirmed
-meaning of each:
+**The VP230 breakout in hand carries a 10 kΩ and a 120 Ω.** What each one does, and
+what hardware actually showed:
 
-- **10 kΩ, RS (pin 8) to GND** — puts the part in *slope-control* mode
+- **10 kΩ, RS (pin 8) to GND** — *slope-control* mode
   (`sn65hvd230.pdf` pin table: "10kΩ to 100kΩ pull down to GND = slope control mode").
-  The driver is **enabled**. Not listen-only. **Fix without desoldering:** wire RS
-  directly to 3.3 V, at pin 8 or at the RS-side pad of the resistor. A hard 3.3 V
-  connection overrides a 10 kΩ pull-down — RS sits at 3.3 V (the resistor sinks a
-  harmless 0.33 mA), above the 0.75·VCC standby threshold, and the driver switches
-  off. Removing the resistor also works; it just isn't required.
-- **120 Ω, across CANH/CANL** — bus termination. **Keep it.** See the topology below:
-  the Development Board Type C appears to carry no terminator of its own, so the
-  sniffer is the natural thing to terminate that end of the bus with.
+  **Leave it exactly as it is.** See the finding below.
+- **120 Ω, across CANH/CANL** — bus termination. **Keep it.** The Development Board
+  Type C appears to carry no terminator of its own, so the sniffer terminates that end
+  of the bus. See the topology below.
 
-**TXD → 3.3 V is mandatory regardless.** The datasheet calls the D pin's internal
-pull-up *weak* and recommends an external 1–10 kΩ pull-up for a dependable recessive
-state; a direct wire is stronger still. Never leave CTX floating. With RS strapped
-high this is belt-and-braces; if RS is left at 10 kΩ, **it is the only thing keeping
-the sniffer passive** — the driver is live, and a floating TXD drifting low would put
-dominant on the bus.
+### Hardware finding, 2026-09-16: do NOT put the VP230 in standby mode
+
+**Tying RS to 3.3 V leaves RXD stuck recessive — no data at 1 Mbit/s.** Verified on
+hardware: CANH/CANL carried clean traffic on a scope while RXD sat permanently high.
+Removing the RS wire, so the module's 10 kΩ pulls it back to slope-control mode, made
+the receiver work immediately. The part was confirmed marked **VP230**, so this is not
+a mis-populated SN65HVD231.
+
+This contradicts what the datasheet implies. §10.4.3 calls RS-high "Standby Mode
+(Listen Only Mode)" and says "the driver is switched off and the receiver remains
+active"; Table 2 lists RXD as "Mirrors Bus State"; and the receiver switching
+characteristics in §8.8 carry no RS condition at all. **An absent degraded-timing spec
+is not a guarantee of full-rate operation in that mode.** Read §10.4.3's framing
+again and the intent shows: it talks about letting the controller "monitor the bus for
+activity" and waking on a dominant edge — that is wake-up detection, not 1 Mbit/s data
+reception.
+
+**So the correct VP230 strapping is:**
+
+| Pin | Connect to | Role |
+|---|---|---|
+| 8 — RS | **nothing** — leave the module's 10 kΩ to GND | slope-control mode, receiver fully active |
+| 1 — TXD / CTX | **3.3 V**, hard-wired | **this is now the entire passivity guarantee** |
+
+Slope control costs nothing here: it only limits the *driver's* slew rate, and the
+driver is never used. Tying RS to GND (high-speed mode) works equally well; the 10 kΩ
+is already fitted, so there is no reason to touch it.
+
+**The TXD strap is safety-critical in this configuration.** In slope-control mode the
+driver is **enabled**. The only thing preventing the sniffer from asserting dominant on
+a live motor bus is TXD being held high. Solder it; do not rely on a probe touching a
+pad, and never leave it floating. The datasheet calls the D pin's internal pull-up
+*weak* and recommends an external 1–10 kΩ pull-up for a dependable recessive state — a
+hard wire is stronger still.
 
 Module header, final: `3V3` → 3.3 V, `GND` → GND, `CTX` → 3.3 V, `CRX` → UPduino
-header 23, plus one added wire RS → 3.3 V. The 120 Ω stays.
+header 23. Nothing on RS. The 120 Ω stays.
+
+**For the TCAN330GD later, this finding may not transfer.** Its Silent Mode (§6.4.3) is
+a purpose-built receive-only mode — "the CAN driver is disabled but the receiver is
+fully operational" — not a repurposed low-power standby, so S → 3.3 V is probably
+genuinely listen-only. But verify it on hardware the same way (scope on CANH/CANL and
+on RXD simultaneously) before trusting it, and keep the TXD strap either way.
+
+### Debugging a silent RXD
+
+The sequence that found this, worth repeating if RXD ever goes quiet:
+
+1. **Scope CANH/CANL first** — on *analog* channels, not digital. That separates "the
+   bus is dead" from "the transceiver is not receiving." Idle sits at ~2.5 V on both;
+   dominant pulls CANH to ~3.5 V and CANL to ~1.5 V.
+2. **Check absolute levels, not just toggling.** Digital channels only give high/low.
+   `CAN1` on the Dev Board is a 2-pin port with **no ground**, and the GM6020 runs from
+   its own 24 V supply, so the bus common-mode can drift if grounds are not tied. The
+   SN65HVD230 resolves the differential only within **−2 V to +7 V** (§8.3) of its own
+   ground; outside that the receiver stops and RXD parks recessive.
+3. **Logic threshold for RXD: 1.65 V** (half of 3.3 V), user-defined. Do **not** use a
+   2.5 V "CMOS" preset — that value targets 5 V logic, and the datasheet's receiver
+   VOH minimum is **2.4 V** (§8.6), below such a threshold.
+4. **Measure VCC at the chip**, not at the supply. Recommended range is **3.0–3.6 V**
+   (§8.3).
+5. **Read the chip marking.** VP230 = standby (receiver on), VP231 = *sleep*, receiver
+   **off**, RXD parked high — an identical symptom from a different cause.
 
 ### 3. The bus itself — who terminates what
 
