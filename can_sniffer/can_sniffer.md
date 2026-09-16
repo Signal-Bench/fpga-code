@@ -294,8 +294,9 @@ LED map — the RGB is one physical part, so these mix:
 | blue + red, no green | frames arriving but erroring |
 
 Red is deliberately driven from *raw pin edges*, independent of the decoder, so a
-wiring fault can be told apart from a decode fault. `dbg_frame` (FPGA pin 21, header
-39) pulses ~1 µs on every decoded record — a scope trigger.
+wiring fault can be told apart from a decode fault. `dbg_frame` (FPGA pin 42, header
+22 — deliberately next to `can_rx` on header 23, so one scope ground reaches both)
+pulses ~1 µs on every decoded record, for a scope trigger.
 
 The UPduino header has two numberings that are easy to confuse: the **FPGA pin** (what
 goes in the `.pcf`) and the **header position** (where the wire physically goes). The
@@ -495,6 +496,12 @@ Once the top module exists, the SPI drain goes to a logic analyzer:
 | `spi_cs` | 19 | **37** (right) |
 | `spi_mosi` | 21 | **39** (right) |
 | GND | — | **42** (right) |
+
+These three are already reserved in `can_sniffer.pcf` even though `can_bringup.v` has
+no drain to bind them to — `-nowarn` makes an unbound `set_io` harmless, and the
+reservation stops anything else being assigned there by accident. `dbg_frame` sits on
+FPGA pin **42** (header 22) specifically to stay clear of them; an earlier revision had
+it on pin 21, which is `spi_mosi`.
 
 Same pins as `i2c_sniffer`, so an existing analyzer setup carries over. A scope
 channel on transceiver pin 4 (RXD) alongside is the way to settle any "is it the bus

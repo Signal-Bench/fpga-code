@@ -5,8 +5,10 @@
 # clock and the design does nothing.  See clock_choice.md.
 #
 # Numbers below are FPGA pins (what the .pcf wants), not header positions.
-#   clk_12 20 -> header 44 (do not connect anything there once OSC is shorted)
-#   can_rx 38 -> header 23
+#   clk_12    20 -> header 44 (do not connect anything there once OSC is shorted)
+#   can_rx    38 -> header 23
+#   dbg_frame 42 -> header 22 (deliberately next to can_rx, so one scope ground
+#                              reaches both)
 
 set_io -nowarn clk_12       20
 set_io -nowarn can_rx       38
@@ -15,6 +17,15 @@ set_io -nowarn led_r        41
 set_io -nowarn led_g        39
 set_io -nowarn led_b        40
 
-set_io -nowarn dbg_frame    21
+set_io -nowarn dbg_frame    42
 
+# Drive the on-board SPI flash chip-select high so it stays off the shared pins.
 set_io -nowarn spi_cs_flash 16
+
+# Reserved for the SPI drain in can_sniffer.v -- same pins as i2c_sniffer.pcf, so
+# an existing logic-analyzer setup carries over.  can_bringup.v has no drain, so
+# these bind to nothing today; -nowarn makes that harmless and keeps the
+# reservation visible.  dbg_frame must NOT sit on any of them.
+set_io -nowarn spi_sck      11
+set_io -nowarn spi_cs       19
+set_io -nowarn spi_mosi     21

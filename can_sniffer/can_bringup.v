@@ -13,7 +13,8 @@
  * The RGB LED is one physical part, so these mix: idle looks like slow blue
  * blink, a healthy 1 kHz GM6020 feedback stream looks white-ish.
  *
- * dbg_frame pulses high for ~1 us on every decoded record, for a scope trigger.
+ * dbg_frame (FPGA pin 42, header 22 -- next to can_rx on 23) pulses high for ~1 us
+ * on every decoded record, for a scope trigger.
  *
  * Clock MUST come from the 12 MHz on-board oscillator (short jumper R16,
  * silkscreen "OSC") -- not SB_HFOSC.  See clock_choice.md.
