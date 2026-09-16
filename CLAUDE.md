@@ -6,8 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A capstone project (**SignalBench**) targeting the Lattice iCE40 UP5K FPGA on an
 UPduino v3 board, paired with an ESP32-H2 MCU and a mobile app over BLE. The active RTL
-work in this repo is `i2c_sniffer/` (complete, hardware-tested) and `can_sniffer/`
-(in progress): bus sniffers that capture traffic and drain it out over a bit-banged
+work in this repo is `i2c_sniffer/` and `can_sniffer/`, both complete and
+hardware-tested: bus sniffers that capture traffic and drain it out over a bit-banged
 SPI link to a host. The repo also contains several
 earlier/simpler UART↔SPI bridge designs built along the way (each its own protocol
 analyzer, one per directory), plus vendored example collections used as reference
@@ -18,11 +18,11 @@ isn't implemented in code yet.
 ## Target System Architecture (SignalBench)
 
 This section is summarized from the capstone report and describes the *planned* full
-system. Only `i2c_sniffer/` is a complete, hardware-tested piece of it. `can_sniffer/`
-is partially built — the bit timing block is written and simulated, the rest is
-designed but not coded. The ESP32-H2 state-management link, the trigger subsystem, and
-the digital-I/O / RS-232 / RS-485 / SPI decoders below are design targets, not modules
-that exist in this repo yet, unless a note says otherwise. Don't assume code implementing this exists — check
+system. `i2c_sniffer/` and `can_sniffer/` are complete, hardware-tested pieces of it
+(both decoders verified against real buses, both draining records over SPI). The
+ESP32-H2 state-management link, the trigger subsystem, and the digital-I/O / RS-232 /
+RS-485 / SPI decoders below are design targets, not modules that exist in this repo
+yet, unless a note says otherwise. Don't assume code implementing this exists — check
 before referencing it.
 
 Five subsystems: sampling, decoding, trigger, recording, and state management.
@@ -96,7 +96,7 @@ time` in each design directory, don't expect them to be present after a fresh cl
 ```
 common/            shared includes: uart.v, util.v, and the general upduino_v3.pcf
 i2c_sniffer/        primary design — see below
-can_sniffer/        CAN 2.0B sniffer — bit timing done, decoder in progress (see below)
+can_sniffer/        CAN 2.0B sniffer — complete, hardware-tested against a GM6020 (see below)
 uart_to_spi/        UART sniffer -> SPI bridge (structural ancestor of i2c_sniffer)
 host_to_spi/        UART-to-host bridge that drives a real SPI *master* transaction
 host_to_fpga/        UART echo + inverted-byte-response demo, used to validate the link
@@ -180,29 +180,46 @@ characterized on hardware.
 
 ## CAN sniffer: can_sniffer
 
-Passive CAN 2.0B sniffer, successor to `i2c_sniffer`. **In progress** — bit timing,
-CRC-15 and the frame decoder are written and pass simulation; record packing, the EBR
-ring, the SPI drain and the top module are specified in `can_sniffer/can_sniffer.md`
-but not coded. Nothing has been on hardware. There is no `build`/`flash` target yet
-because there is no top module.
+Passive CAN 2.0B sniffer, successor to `i2c_sniffer`. **Complete and hardware-tested**
+(2026-09-16) against a RoboMaster GM6020 motor driven by a Development Board Type C at
+1 Mbit/s: bit timing, CRC-15, frame decoder, 20-byte record packer, 16-record EBR ring,
+and a 6 MHz bit-banged SPI master drain, with records verified on a logic analyzer
+against the CAN waveform. 1292 LCs (24% of the UP5K), one EBR, timing closes at
+~21.8 MHz against the 12 MHz constraint.
 
 All commands run from `can_sniffer/`:
 
 ```
-make sim              # both testbenches
+make build            # yosys -> nextpnr (up5k, sg48, 12 MHz) -> icepack -> can_sniffer.bin
+make flash            # iceprog -d i:0x0403:0x6014 can_sniffer.bin
+make time             # icetime timing report -> timing.rpt
+make sim              # all three testbenches
 make sim-timing       # bit recovery only, at the nominal rate
-make sim-frame        # full decode chain, 16 tests
-make synth-check      # yosys resource estimate (no top module to build yet)
-make wave / wave-frame        # as above, dumping VCD and opening gtkwave
-make sweep-timing             # oscillator-offset sweep, both worst-case patterns
-make sweep-segments           # compares candidate bit-time segment configurations
-make clean            # removes sim artifacts only (non-destructive, unlike i2c_sniffer)
+make sim-frame        # decoder, 16 tests, own CRC + stuffing
+make sim-top          # end to end: CAN bits in, SPI records out, sampled like an analyzer
+make synth-check      # yosys resource estimate for the top
+make sweep-timing     # oscillator-offset sweep, both worst-case patterns
+make sweep-segments   # compares candidate bit-time segment configurations
+make build-bringup    # reduced top (decoder + LEDs, no drain) for isolating faults
+make clean            # removes build/sim artifacts only (non-destructive, unlike i2c_sniffer)
 ```
 
-`can_frame_fsm_tb.v` builds real frames from scratch — computing CRC-15 and applying
-bit stuffing independently of the DUT — so it is a genuine cross-check, not a
-round-trip against the same code. The decoder synthesizes at 316 LUT4 + ~271 FF, ~6%
-of the UP5K.
+Two top modules: `can_sniffer.v` is the real one; `can_bringup.v` is the same decoder
+with only LEDs and a scope-trigger pin, kept for isolating "is it the decoder or the
+drain". Both share `can_sniffer.pcf`. The SPI drain uses the same pins as
+`uart_to_spi`/`spi_hw_stream` (FPGA 11/19/21) but the FPGA is **master** here and
+there is no MISO.
+
+**Record format** (20 bytes, MSB first, SPI mode 0, one record per CS assertion):
+`AA | flags | id[4] | dlc | data[8] | timestamp[4] | 55`. Flags are
+`{ide, rtr, overload, ack_ok, crc_ok, err[2:0]}`; `crc_ok` reports the CRC comparison
+alone, so a no-ACK frame reads `err=4, ack_ok=0, crc_ok=1`. Timestamps count **bit
+times** latched at SOF, so at 1 Mbit/s the unit is 1 µs. Full layout and the
+error-code table are in `can_sniffer/can_sniffer.md`.
+
+`can_frame_fsm_tb.v` and `can_sniffer_tb.v` build real frames from scratch — computing
+CRC-15 and applying bit stuffing independently of the DUT — so they are genuine
+cross-checks, not round-trips against the same code.
 
 ### The one thing that makes CAN different from every other design here
 
@@ -236,7 +253,17 @@ transceiver wiring, pin plan.
   parse them, or it loses frame sync.
 - The test bus is a GM6020 motor: 1 Mbit/s, **standard frames only**, DLC 8. Extended
   (29-bit) frames are supported in the decoder but the bench rig will never exercise
-  them — they need a synthetic testbench.
+  them — they are covered by the synthetic testbenches only.
+- **The VP230 transceiver must NOT have RS tied high.** TI's "Standby (Listen Only)"
+  mode leaves RXD stuck recessive at 1 Mbit/s, despite what the datasheet implies.
+  Leave RS on the breakout's 10 kΩ (slope-control mode) and hard-wire TXD to 3.3 V —
+  that strap is the entire passivity guarantee. Verified on hardware; details in
+  `notes.md` and `can_sniffer/can_sniffer.md`.
+- **SPI drain rate is 6 MHz**, the ceiling from a 12 MHz clock. Raising it exposed a
+  latent EBR settle-state bug that the old 1 MHz tick had hidden — see the `S_SETTLE`
+  comment in `can_sniffer.v` before touching the drain FSM.
+- UPduino header **position 2 is `VIO`, not a 3.3 V supply**; the 3.3 V rail is
+  position 9. `VIO` floats by default and meters as ~2.3 V of leakage.
 
 ## Other protocol analyzers / stepping-stone designs
 

@@ -1,8 +1,8 @@
 # can_sniffer - CAN 2.0B bus sniffer for iCE40 UP5K / UPduino v3
 #
-# No top module or bitstream yet: bit timing, CRC-15 and the frame decoder
-# exist and simulate.  Build/flash targets arrive with can_sniffer.v (record
-# packing, EBR ring, SPI drain, LEDs).
+# Complete and hardware-tested.  `build` produces the full sniffer
+# (can_sniffer.v: decoder + record packer + EBR ring + 6 MHz SPI drain);
+# `build-bringup` produces the LED-only variant for fault isolation.
 #
 # NOTE: this design must be clocked from the UPduino's 12 MHz on-board
 # oscillator (short jumper R16 / "OSC"), not SB_HFOSC.  See clock_choice.md.

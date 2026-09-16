@@ -4,12 +4,15 @@ Passive CAN sniffer for the iCE40 UP5K on an UPduino v3, draining decoded frames
 host over bit-banged SPI. Structurally the successor to `i2c_sniffer/`, but the front
 end is entirely different: CAN has no clock line, so the bit clock must be recovered.
 
-**Status as of 2026-09-10:** bit timing, CRC-15 and the frame decoder are implemented
-and passing simulation (16 tests). Record packing, the EBR ring, the SPI drain and the
-top module are designed below but **not written yet**. Nothing has been on hardware.
+**Status as of 2026-09-16: complete and hardware-tested.** The full chain — bit timing,
+CRC-15, frame decoder, record packer, EBR ring and 6 MHz SPI drain — decodes a live
+GM6020 ↔ Development Board Type C bus at 1 Mbit/s, with records verified on a Keysight
+MSOX3024T logic analyzer against the CAN waveform: `AA`/`55` framing lands where
+expected, IDs and payloads match, timestamps advance, and the no-ACK case reports
+`err=4, ack_ok=0, crc_ok=1` as designed.
 
-The decoder synthesizes for the UP5K at **316 LUT4 + ~271 FF**, roughly 6% of the
-device's 5280 LUTs — `make synth-check`.
+Full top: **1292 LCs (24% of the UP5K), 1 EBR**, timing closes at ~21.8 MHz against the
+12 MHz constraint. `make build && make flash`.
 
 ## Target bus
 
@@ -300,10 +303,10 @@ scope on RXD when bit-level truth is needed, should be enough. Easy to add later
 
 ## Bench wiring
 
-There is now a bitstream to flash: `can_bringup.v` (`make build && make flash`). It is
-clock + pin + decoder + LEDs only — no SPI drain, no capture RAM, no record packing.
-Its job is to answer on hardware how far the chain gets. 533 LCs (10% of the UP5K),
-timing closes at 20.6 MHz against the 12 MHz constraint.
+Two bitstreams. `can_sniffer.v` is the real one (`make build && make flash`).
+`can_bringup.v` (`make build-bringup && make flash-bringup`) is the same decoder with
+only LEDs and the scope-trigger pin — no drain — kept for isolating "is it the decoder
+or the drain" if something regresses. Both share this LED map.
 
 LED map — priority-encoded and mutually exclusive, so each state is one colour rather
 than the three channels summing to white:
@@ -511,9 +514,9 @@ ground in the connector, which avoids the extra wire — but the GM6020's own ca
 
 Power the GM6020 from 24 V on its XT30.
 
-### 4. Validation outputs (planned pins, from the pin plan above)
+### 4. Validation outputs
 
-Once the top module exists, the SPI drain goes to a logic analyzer:
+The SPI drain goes to a logic analyzer:
 
 | Signal | FPGA pin | Header position |
 |---|---|---|
@@ -549,11 +552,19 @@ or the decoder" question — that pin is the ground truth the FPGA sees.
 make sim              # both testbenches
 make sim-timing       # bit recovery only, nominal rate
 make sim-frame        # full decode chain, 16 tests
-make synth-check      # yosys resource estimate (no top module yet)
+make synth-check      # yosys resource estimate for the top
 make wave / wave-frame        # as above but dump VCD and open gtkwave
 make sweep-timing             # frequency-offset sweep, both stimulus patterns
 make sweep-segments           # compare candidate segment configurations
 ```
+
+**Logic analyzer settings for the drain:** MSB first, 8-bit words, SPI mode 0 (clock
+idles low, sample on rising edge), CS active low used for framing, ~6 MHz, 20 bytes per
+CS assertion. Every record starts `0xAA` and ends `0x55`; because `0xAA` bit-reversed
+is `0x55`, a wrong bit-order setting shows the markers *swapped* rather than garbled —
+an unambiguous "flip MSB/LSB" signal. Shifted-but-plausible data usually means the
+wrong clock edge. SCK is not continuous (each byte costs 19 ticks, ~250 ns low between
+bytes with CS held); analyzers count edges, so this decodes normally.
 
 `can_frame_fsm_tb.v` builds real frames from scratch — it computes the CRC-15 and
 applies bit stuffing itself, independently of the DUT — then drives the bit stream onto
