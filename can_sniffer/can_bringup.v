@@ -4,14 +4,14 @@
  * No SPI drain, no capture RAM, no record packing -- just clock, pin, decoder
  * and LEDs.  Its whole job is to answer, on hardware, how far the chain gets:
  *
- *   dark                     no power / not configured
- *   blue blinking only       clocked (R16 "OSC" jumper is good), no bus edges
- *   blue + red               edges arriving on can_rx, but nothing decodes
- *   blue + red + green       frames decoding cleanly
- *   red solid-ish, no green  frames arriving but erroring
+ *   dark             no power / not configured
+ *   blue blinking    clocked (R16 "OSC" jumper is good), no edges on can_rx
+ *   red blinking     edges arriving on can_rx, but nothing decodes
+ *   red solid        frames decoding, but every one of them has an error
+ *   green            frames decoding cleanly
  *
- * The RGB LED is one physical part, so these mix: idle looks like slow blue
- * blink, a healthy 1 kHz GM6020 feedback stream looks white-ish.
+ * The states are priority-encoded and mutually exclusive, so each shows as one
+ * colour rather than a mix -- a healthy bus is plain green.
  *
  * dbg_frame (FPGA pin 42, header 22 -- next to can_rx on 23) pulses high for ~1 us
  * on every decoded record, for a scope trigger.
@@ -102,9 +102,22 @@ module can_bringup (
 		dbg_ctr <= frame_strobe ? 5'd12      : (dbg_ctr - (dbg_ctr != 0));
 	end
 
+	// ----------------------------------------------------------------
+	// LED priority encoder.  Highest state wins outright so each condition
+	// shows as a single colour instead of the three channels summing to
+	// white.  Blinking versus solid separates the two red cases.
+	// ----------------------------------------------------------------
+	wire ok_recent  = (ok_ctr  != 0);
+	wire bad_recent = (err_ctr != 0);
+	wire act_recent = (act_ctr != 0);
+
+	wire show_green = ok_recent;
+	wire show_red   = ~ok_recent & (bad_recent | (act_recent & heartbeat));
+	wire show_blue  = ~ok_recent & ~bad_recent & ~act_recent & heartbeat;
+
 	// LEDs are active low on the UPduino.
-	assign led_b     = ~heartbeat;
-	assign led_r     = ~((act_ctr != 0) | (err_ctr != 0));
-	assign led_g     = ~(ok_ctr != 0);
+	assign led_r     = ~show_red;
+	assign led_g     = ~show_green;
+	assign led_b     = ~show_blue;
 	assign dbg_frame = (dbg_ctr != 0);
 endmodule

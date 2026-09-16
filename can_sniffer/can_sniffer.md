@@ -283,18 +283,21 @@ clock + pin + decoder + LEDs only — no SPI drain, no capture RAM, no record pa
 Its job is to answer on hardware how far the chain gets. 533 LCs (10% of the UP5K),
 timing closes at 20.6 MHz against the 12 MHz constraint.
 
-LED map — the RGB is one physical part, so these mix:
+LED map — priority-encoded and mutually exclusive, so each state is one colour rather
+than the three channels summing to white:
 
 | What you see | Means |
 |---|---|
 | dark | no power, or not configured |
-| **blue blinking only** (~1.4 Hz) | clocked — R16/OSC jumper is good — but no edges on `can_rx` |
-| **blue + red** | edges arriving at the FPGA pin, but nothing decodes |
-| **blue + red + green** | frames decoding cleanly — a 1 kHz GM6020 stream looks white-ish |
-| blue + red, no green | frames arriving but erroring |
+| **blue blinking** (~1.4 Hz) | clocked — R16/OSC jumper is good — but no edges on `can_rx` |
+| **red blinking** | edges arriving at the FPGA pin, but nothing decodes |
+| **red solid** | frames decoding, but every one carries an error |
+| **green** | frames decoding cleanly |
 
-Red is deliberately driven from *raw pin edges*, independent of the decoder, so a
-wiring fault can be told apart from a decode fault. `dbg_frame` (FPGA pin 42, header
+The blinking-red state is driven from *raw pin edges*, independent of the decoder, so a
+wiring fault reads differently from a decode fault. Solid red versus blinking red is
+the difference between "the decoder is working and the bus has a problem" and "the
+decoder is getting nothing usable". `dbg_frame` (FPGA pin 42, header
 22 — deliberately next to `can_rx` on header 23, so one scope ground reaches both)
 pulses ~1 µs on every decoded record, for a scope trigger.
 
