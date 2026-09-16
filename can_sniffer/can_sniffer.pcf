@@ -1,31 +1,40 @@
 # can_sniffer / can_bringup pinout for UPduino v3
 #
-# clk_12 REQUIRES jumper R16 ("OSC" on the silkscreen) to be shorted -- that is
-# what routes the on-board 12 MHz oscillator to gpio_20.  Without it there is no
-# clock and the design does nothing.  See clock_choice.md.
+# The clock is the board's 12 MHz oscillator, NOT SB_HFOSC, and it only
+# reaches the FPGA if jumper R16 ("OSC" on the silkscreen) is shorted.
+# Without that jumper there is no clock and the design does nothing.  CAN is
+# NRZ with no clock line, so ISO 11898-1 imposes a real accuracy budget that
+# the internal oscillator misses by ~10x — see clock_choice.md.
 #
-# Numbers below are FPGA pins (what the .pcf wants), not header positions.
-#   clk_12    20 -> header 44 (do not connect anything there once OSC is shorted)
-#   can_rx    38 -> header 23
-#   dbg_frame 42 -> header 22 (deliberately next to can_rx, so one scope ground
-#                              reaches both)
-
-set_io -nowarn clk_12       20
-set_io -nowarn can_rx       38
+# SCK / MOSI / CS keep the same pins uart_to_spi.v and spi_hw_stream.v use, so
+# an existing logic-analyzer setup carries over unchanged.  Unlike
+# spi_hw_stream the FPGA is the MASTER here and drives all three; there is no
+# MISO because the sniffer only ever pushes data out.  These are general
+# fabric pins, not the UP5K's dedicated config-SPI pads (14/15/16/17), which
+# keeps the onboard flash and the FTDI programmer off this bus; pin 16 is
+# still driven high to hold the flash deselected.
+#
+# dbg_frame is a scope trigger, one pulse per decoded record.  It sits on
+# gpio_42 deliberately: that is header position 22, right beside can_rx on
+# position 23, so a single scope ground lead reaches both — and it stays well
+# clear of the SPI pins.
+#
+# Numbers below are FPGA pins, which are not header positions:
+#   clk_12 20 -> header 44 (leave that position unconnected once OSC is shorted)
+#   can_rx 38 -> header 23        dbg_frame 42 -> header 22
+#   spi_sck 11 -> header 35       spi_cs 19 -> header 37
+#   spi_mosi 21 -> header 39      GND -> header 42
 
 set_io -nowarn led_r        41
 set_io -nowarn led_g        39
 set_io -nowarn led_b        40
 
-set_io -nowarn dbg_frame    42
-
-# Drive the on-board SPI flash chip-select high so it stays off the shared pins.
 set_io -nowarn spi_cs_flash 16
 
-# Reserved for the SPI drain in can_sniffer.v -- same pins as i2c_sniffer.pcf, so
-# an existing logic-analyzer setup carries over.  can_bringup.v has no drain, so
-# these bind to nothing today; -nowarn makes that harmless and keeps the
-# reservation visible.  dbg_frame must NOT sit on any of them.
+set_io -nowarn clk_12       20
+set_io -nowarn can_rx       38
+set_io -nowarn dbg_frame    42
+
 set_io -nowarn spi_sck      11
 set_io -nowarn spi_cs       19
 set_io -nowarn spi_mosi     21

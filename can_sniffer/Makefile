@@ -10,11 +10,11 @@
 bt_tb        = can_bit_timing_tb
 fr_tb        = can_frame_fsm_tb
 rtl          = can_crc15.v can_frame_fsm.v can_bit_timing.v
-top_module   = can_bringup
+top_module   = can_sniffer
 pcf_file     = can_sniffer.pcf
 pnr_freq_mhz = 12
 
-# Bring-up bitstream: clock + pin + decoder + LEDs, no SPI drain yet.
+# Full bitstream: decoder + record packer + EBR ring + SPI drain + LEDs.
 build:
 	yosys -p "synth_ice40 -top $(top_module) -json $(top_module).json" $(rtl) $(top_module).v
 	nextpnr-ice40 --up5k --package sg48 --json $(top_module).json --pcf $(pcf_file) --asc $(top_module).asc --freq $(pnr_freq_mhz)
@@ -23,11 +23,21 @@ build:
 flash:
 	iceprog -d i:0x0403:0x6014 $(top_module).bin
 
+# Reduced bitstream: clock + pin + decoder + LEDs only, no SPI drain. Useful
+# for isolating a problem to the decoder when the drain is misbehaving.
+build-bringup:
+	yosys -p "synth_ice40 -top can_bringup -json can_bringup.json" $(rtl) can_bringup.v
+	nextpnr-ice40 --up5k --package sg48 --json can_bringup.json --pcf $(pcf_file) --asc can_bringup.asc --freq $(pnr_freq_mhz)
+	icepack can_bringup.asc can_bringup.bin
+
+flash-bringup:
+	iceprog -d i:0x0403:0x6014 can_bringup.bin
+
 time: $(top_module).asc
 	icetime -d up5k -c $(pnr_freq_mhz) -mtr timing.rpt $(top_module).asc
 	@echo "Timing report written to timing.rpt. Check PASS/FAIL at the bottom."
 
-sim: sim-timing sim-frame
+sim: sim-timing sim-frame sim-top
 
 # Bit recovery only: nominal rate, no frames.
 sim-timing:
@@ -40,9 +50,14 @@ sim-frame:
 	iverilog -g2012 -o $(fr_tb).out $(rtl) $(fr_tb).v
 	vvp $(fr_tb).out
 
-# Resource check; there is no top module yet, so synthesize the decoder alone.
+# End to end: CAN bit stream in, SPI records out, checked the way a logic
+# analyzer would sample them.
+sim-top:
+	iverilog -g2012 -o can_sniffer_tb.out $(rtl) can_sniffer.v can_sniffer_tb.v
+	vvp can_sniffer_tb.out
+
 synth-check:
-	yosys -p "read_verilog $(rtl); synth_ice40 -top can_frame_fsm"
+	yosys -p "read_verilog $(rtl) can_sniffer.v; synth_ice40 -top can_sniffer"
 
 wave:
 	iverilog -g2012 -o $(bt_tb).out can_bit_timing.v $(bt_tb).v
@@ -77,4 +92,5 @@ sweep-segments:
 	done
 
 clean:
-	rm -rf $(top_module).json $(top_module).asc $(top_module).bin timing.rpt $(bt_tb).out $(fr_tb).out can_bit_timing_tb.vcd can_frame_fsm_tb.vcd
+	rm -rf can_sniffer_tb.out can_sniffer_tb.vcd $(top_module).json $(top_module).asc $(top_module).bin \
+	       can_bringup.json can_bringup.asc can_bringup.bin timing.rpt $(bt_tb).out $(fr_tb).out can_bit_timing_tb.vcd can_frame_fsm_tb.vcd

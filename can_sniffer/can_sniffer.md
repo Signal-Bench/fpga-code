@@ -48,7 +48,8 @@ PHASE_SEG2=3`, sample point at 75%, SJW = 3 (the largest ISO 11898-1 clause 11.3
 | `can_bit_timing.v` | tq generator, segment FSM, hard sync + resync, sample point | **done** |
 | `can_crc15.v` | CRC-15 shift register, poly `0x4599` | **done** |
 | `can_frame_fsm.v` | field FSM, destuffing, error + overload detection | **done** |
-| `can_sniffer.v` | top: record packing, EBR ring, SPI drain, LEDs | planned |
+| `can_sniffer.v` | top: record packing, EBR ring, SPI drain, LEDs | **done** |
+| `can_bringup.v` | reduced top: decoder + LEDs only, no drain | **done** |
 
 `can_frame_fsm.v` emits a record on `frame_strobe` with the identifier, IDE/RTR, DLC,
 data (left-justified so `data[0]` is always in `[63:56]`, whatever the DLC), `crc_ok`,
@@ -141,17 +142,27 @@ always. So there is no need for `i2c_sniffer.v`'s variable-length ping-pong buff
 `{buf_sel, len}` descriptor queue. Fixed-size records into a flat ring buffer:
 
 ```
-byte  0      0xAA record marker
-byte  1      flags: IDE, RTR, overload_seen, ack_ok, crc_ok, err_code[2:0]
-bytes 2–5    identifier, 29-bit right-justified, big-endian
-byte  6      DLC
-bytes 7–14   data[0..7]
-bytes 15–18  timestamp, 32-bit, in bit times
-byte  19     reserved / error bit position
+byte  0      0xAA   start marker
+byte  1      flags  {ide, rtr, overload, ack_ok, crc_ok, err[2:0]}
+bytes 2–5    identifier, 29 bits right-justified in 32, big-endian
+byte  6      {dropped, 3'b000, dlc[3:0]}
+bytes 7–14   data[0..7]  (left-justified: data[0] is always byte 7)
+bytes 15–18  timestamp, 32-bit, big-endian, in bit times, latched at SOF
+byte  19     0x55   end marker
 ```
 
-**20 bytes, fixed stride** — addressing is `record_idx × 20`, no length field, no
-descriptor queue, no partial-byte flush.
+**20 bytes, fixed stride.** `0xAA` start and `0x55` end give a strong framing signature,
+so a logic analyzer or host can resynchronize on any record boundary.
+
+`err`: 0 none, 1 stuff, 2 crc, 3 form, 4 ack, 5 unattributed, 6 stuck-dominant.
+`dropped` means at least one record was lost to a full buffer before this one.
+**`crc_ok` reports the CRC comparison alone**, independent of any other error — so a
+no-ACK frame comes back with `err=4`, `ack_ok=0` and `crc_ok=1`, which correctly says
+the frame was intact and merely unacknowledged.
+
+Buffering is one EBR as **16 records × 32 bytes** (only 20 used; the power-of-two stride
+turns addressing into a concatenation instead of a multiply). At ~2000 frames/s that is
+~8 ms of burst tolerance against a 160 µs drain.
 
 At ~2000 frames/s that is 40 KB/s against 125 KB/s available at the existing 1 MHz SPI
 drain, so ~3× headroom and no need to raise the SPI clock for v1.

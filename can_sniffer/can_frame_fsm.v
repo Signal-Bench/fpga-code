@@ -352,14 +352,16 @@ module can_frame_fsm (
 						// for a reason we could not observe -- most likely a
 						// bit error, but we cannot prove that from one point
 						// on the bus, so report it as unattributed.
+						// crc_ok reports the CRC comparison alone, so a host can
+						// tell "CRC was fine, something else went wrong" from
+						// "the CRC actually failed".
 						emit_record((err_latch == ERR_NONE) ? ERR_UNATTR : err_latch,
-						            1'b0);
+						            (crc_calc == crc_rx));
 						state       <= S_RECOVER;
 						stuffing_on <= 1'b0;
 					end else if (bit_cnt == 7'd5) begin
 						// Valid for a receiver at the last-but-one EOF bit.
-						emit_record(err_latch,
-						            (crc_calc == crc_rx) && (err_latch == ERR_NONE));
+						emit_record(err_latch, (crc_calc == crc_rx));
 						bit_cnt <= bit_cnt + 7'd1;
 					end else if (bit_cnt == 7'd6) begin
 						bit_cnt <= 7'd0;
@@ -396,6 +398,7 @@ module can_frame_fsm (
 
 	// Emit a record.  Declared after use above is fine for a task in the same
 	// module; it exists to keep the two exit paths from EOF in sync.
+	// ok: result of the CRC comparison only, independent of any other error.
 	task emit_record(input [2:0] code, input ok);
 		begin
 			frame_id       <= id_sr;
