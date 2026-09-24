@@ -174,7 +174,9 @@ endmodule
  *
  * Add bytes to the queue and they will be printed when the line is idle.
  */
-module uart_tx_fifo(
+module uart_tx_fifo #(
+	parameter NUM = 32
+) (
 	input clk,
 	input reset,
 	input baud_x1,
@@ -182,11 +184,9 @@ module uart_tx_fifo(
 	input data_strobe,
 	output serial
 );
-	parameter NUM = 32;
-
 	wire uart_txd_ready; // high the UART is ready to take a new byte
 	reg uart_txd_strobe; // pulse when we have a new byte to transmit
-	reg [7:0] uart_txd;
+	wire [7:0] uart_txd; // driven by the fifo's read port
 
 	uart_tx txd(
 		.mclk(clk),
@@ -199,7 +199,7 @@ module uart_tx_fifo(
 	);
 
 	wire fifo_available;
-	wire fifo_read_strobe;
+	reg  fifo_read_strobe;
 
 	fifo #(.NUM(NUM), .WIDTH(8)) buffer(
 		.clk(clk),

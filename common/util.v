@@ -73,7 +73,10 @@ module divide_by_n(
 endmodule
 
 
-module fifo(
+module fifo #(
+	parameter WIDTH = 8,
+	parameter NUM = 256
+) (
 	input clk,
 	input reset,
 	output data_available,
@@ -82,9 +85,6 @@ module fifo(
 	output [WIDTH-1:0] read_data,
 	input read_strobe
 );
-	parameter WIDTH = 8;
-	parameter NUM = 256;
-
 	reg [WIDTH-1:0] buffer[0:NUM-1];
 	reg [`CLOG2(NUM)-1:0] write_ptr;
 	reg [`CLOG2(NUM)-1:0] read_ptr;
@@ -109,13 +109,13 @@ module fifo(
 endmodule
 
 
-module pwm(
+module pwm #(
+	parameter BITS = 8
+) (
 	input clk,
 	input [BITS-1:0] bright,
-	output out
+	output reg out
 );
-	parameter BITS = 8;
-
 	reg [BITS-1:0] counter;
 	always @(posedge clk)
 	begin
