@@ -1,0 +1,24 @@
+# spi_to_uart pinout for UPduino v3
+#
+# The SPI side is identical to spi_hw_stream.pcf, so the same jumper harness
+# works for both designs: the FPGA is the SLAVE, the master drives SCK, CS and
+# MOSI, and MISO comes back on gpio_13.
+#
+# What is new is serial_txd on pin 14.  Pin 14 is the FPGA's SPI_SO, which on
+# the UPduino v3 sits on the FLASH_MOSI net together with the FT232H's ADBUS1
+# — the FTDI's receive pin in async serial mode (UPduino_v3.0.sch).  That is
+# why ../common/upduino_v3.pcf calls pin 14 "FPGA transmit to USB", and it is
+# the direction picocom sees.  The net is shared with the onboard flash, so
+# pin 16 still has to hold the flash deselected.
+
+set_io -nowarn led_r        41
+set_io -nowarn led_g        39
+set_io -nowarn led_b        40
+
+set_io -nowarn serial_txd   14
+set_io -nowarn spi_cs_flash 16
+
+set_io -nowarn spi_sck      11
+set_io -nowarn spi_cs       19
+set_io -nowarn spi_mosi     21
+set_io -nowarn spi_miso     13
