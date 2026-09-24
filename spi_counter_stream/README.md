@@ -156,3 +156,9 @@ behavior:
    ~7.6 ns IP→pad on MISO. Start at 1–2 MHz. For a high SCK later, the
    dedicated pins 14/15/16/17 avoid the routing detour (at the cost of sharing
    with the flash and FTDI), and `SPICR1[4]` TXEDGE exists for fast SPI.
+
+   ESP32-H2 masters must use the standard mode-0 rising-edge sample point
+   (`SPI_SAMPLING_POINT_PHASE_1`). Its zero-initialized default delays sampling
+   by half a cycle, landing on the falling edge where this design changes MISO.
+   Hardware captures with that default showed rare bytes with bit 7 sampled
+   high, which an ASCII decoder made look like missing characters.
