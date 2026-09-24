@@ -31,8 +31,8 @@ endmodule
 //     Table 12.8 requires SPITXDR to be written >= 0.5 SCK periods before
 //     the first bit appears on SO, so a slave read always starts with a
 //     dummy.  This model hands over the first real byte immediately, so the
-//     "burst starts at 0x00" checks below are one byte optimistic versus
-//     silicon — on hardware, expect the counter to begin on byte 2.
+//     "burst starts at 'H'" checks below are one byte optimistic versus
+//     silicon — on hardware, expect the message to begin on byte 2.
 // It models the one behaviour this design depends on: a single-deep transmit
 // holding register (SPITXDR) that feeds the shifter at each byte boundary,
 // with TRDY/RRDY status bits driving the handshake.
@@ -178,6 +178,23 @@ module spi_hw_stream_tb;
 
 	localparam integer HALF = 250;   // ns -> 2 MHz SCK
 
+	// The expected message is spelled out here independently of the DUT
+	// so the check is a real cross-check, not a round-trip.  Tick timing is
+	// pulled from the DUT so the waits track DATA_RATE_HZ.
+	localparam integer         MSG_LEN = 12;
+	localparam [8*MSG_LEN-1:0] MSG     = "Hello World!";
+	integer                    TICK_NS = 1_000_000_000 / dut.DATA_RATE_HZ;
+
+	function [7:0] msg_char(input integer i);
+		msg_char = MSG[8*(MSG_LEN-1-(i % MSG_LEN)) +: 8];
+	endfunction
+
+	// Position in the endless "Hello World!Hello World!..." stream that the
+	// next byte off the link must correspond to.  Advances with every byte
+	// read, across bursts — the stream must stay continuous through CS
+	// toggles and through a drop-on-full stall.
+	integer stream_pos = 0;
+
 	top dut (
 		.spi_sck(spi_sck),
 		.spi_cs(spi_cs),
@@ -212,18 +229,20 @@ module spi_hw_stream_tb;
 		end
 	endtask
 
-	// Every byte in the burst must be exactly one more than the previous.
-	task check_consecutive(input integer n, input [127:0] label);
+	// Every byte in the burst must be the next character of the message,
+	// continuing from wherever the stream left off.
+	task check_stream(input integer n, input [127:0] label);
 		integer i;
 		reg [7:0] expect_next;
 		begin
-			for (i = 1; i < n; i = i + 1) begin
-				expect_next = burst[i-1] + 8'd1;
+			for (i = 0; i < n; i = i + 1) begin
+				expect_next = msg_char(stream_pos);
 				if (burst[i] !== expect_next) begin
-					$display("FAIL [%0s]: byte %0d = 0x%02x, expected 0x%02x (prev 0x%02x)",
-					         label, i, burst[i], expect_next, burst[i-1]);
+					$display("FAIL [%0s]: byte %0d = 0x%02x '%c', expected 0x%02x '%c' (stream pos %0d)",
+					         label, i, burst[i], burst[i], expect_next, expect_next, stream_pos);
 					errors = errors + 1;
 				end
+				stream_pos = stream_pos + 1;
 			end
 		end
 	endtask
@@ -233,12 +252,11 @@ module spi_hw_stream_tb;
 		begin
 			$write("  %0s:", label);
 			for (i = 0; i < n; i = i + 1) $write(" %02x", burst[i]);
-			$write("\n");
+			$write("   \"");
+			for (i = 0; i < n; i = i + 1) $write("%c", burst[i]);
+			$write("\"\n");
 		end
 	endtask
-
-	reg [7:0] last_of_burst1;
-	reg [7:0] lag;
 
 	// Count dropped samples straight off the design's internal strobe.
 	integer drop_count = 0;
@@ -256,9 +274,9 @@ module spi_hw_stream_tb;
 
 		// ------------------------------------------------------------
 		// Let the IP get configured, then let the FIFO build a backlog
-		// that is well short of full (64 entries = 128 us at 500 kHz).
+		// that is well short of full (FIFO_DEPTH ticks to fill).
 		// ------------------------------------------------------------
-		#40_000;   // 40 us -> ~20 samples queued, no drops yet
+		#(20 * TICK_NS);   // ~20 characters queued, no drops yet
 
 		if (led_g !== 1'b0) begin
 			$display("FAIL: green LED not lit — hard SPI IP never finished configuring");
@@ -267,32 +285,31 @@ module spi_hw_stream_tb;
 
 		// ------------------------------------------------------------
 		// Test 1: with backlog available and no drops, the master must
-		// see a strictly incrementing sequence starting from 0x00.
+		// see the message from its first character, "Hello World!Hell".
 		// ------------------------------------------------------------
 		spi_burst(16);
 		dump_burst(16, "burst 1");
-		if (burst[0] !== 8'h00) begin
-			$display("FAIL: first streamed byte = 0x%02x, expected 0x00", burst[0]);
+		if (burst[0] !== "H") begin
+			$display("FAIL: first streamed byte = 0x%02x, expected 'H'", burst[0]);
 			errors = errors + 1;
 		end
-		check_consecutive(16, "burst 1");
-		last_of_burst1 = burst[15];
+		check_stream(16, "burst 1");
 
 		// ------------------------------------------------------------
 		// Test 2: stop reading long enough for the FIFO to fill and start
-		// dropping (64 entries * 2 us = 128 us to fill).
+		// dropping (FIFO_DEPTH ticks to fill, then some margin).
 		//
 		// Note on what overflow looks like from the master's side: because
-		// the policy is drop-on-full, the FIFO keeps the OLDEST samples and
-		// discards new ones, so the master does NOT see a jump right after
-		// the stall — it sees a contiguous run of stale data and only hits
-		// the discontinuity once it has drained the backlog.  With a master
-		// slower than 500 kB/s it never drains, so the jump never surfaces.
-		// The drop mechanism is therefore checked directly rather than
-		// inferred from the byte stream.
+		// the policy is drop-on-full, the FIFO keeps the OLDEST characters
+		// and discards new ones, so the master does NOT see a skip right
+		// after the stall — it sees a contiguous run of stale data and only
+		// hits the discontinuity once it has drained the backlog.  With a
+		// master slower than DATA_RATE_HZ it never drains, so the skip never
+		// surfaces.  The drop mechanism is therefore checked directly rather
+		// than inferred from the byte stream.
 		// ------------------------------------------------------------
 		drops_before = drop_count;
-		#300_000;   // 300 us of no master activity
+		#((dut.FIFO_DEPTH + 16) * TICK_NS);   // full FIFO plus 16 dropped
 
 		if (dut.fifo_count !== dut.FIFO_DEPTH) begin
 			$display("FAIL: FIFO not full after stall (count = %0d, expected %0d)",
@@ -316,22 +333,17 @@ module spi_hw_stream_tb;
 		// Buffered data must survive the overflow intact and pick up exactly
 		// where burst 1 stopped — drop-on-full must never corrupt or reorder
 		// what is already queued.
-		check_consecutive(16, "burst 2");
-		if (burst[0] !== last_of_burst1 + 8'd1) begin
-			$display("FAIL: stream not continuous across the stall (0x%02x -> 0x%02x)",
-			         last_of_burst1, burst[0]);
-			errors = errors + 1;
-		end
+		check_stream(16, "burst 2");
 
-		// ...and the master should be reading data well behind the live
-		// counter, which is what "the master is too slow" actually looks like.
-		lag = dut.data_counter - burst[0];
-		if (lag < 8'd32) begin
-			$display("FAIL: expected the master to lag the live counter, lag = %0d", lag);
+		// ...and the master should still be reading well behind the live
+		// source, which is what "the master is too slow" actually looks like:
+		// the FIFO was full, we took 16, so most of the backlog remains.
+		if (dut.fifo_count < dut.FIFO_DEPTH - 16) begin
+			$display("FAIL: expected a backlog after the stall, fifo_count = %0d",
+			         dut.fifo_count);
 			errors = errors + 1;
 		end else begin
-			$display("  master is %0d samples behind the live counter (0x%02x vs 0x%02x)",
-			         lag, burst[0], dut.data_counter);
+			$display("  master is %0d characters behind the live source", dut.fifo_count);
 		end
 
 		// ------------------------------------------------------------
@@ -340,7 +352,7 @@ module spi_hw_stream_tb;
 		// ------------------------------------------------------------
 		spi_burst(8);
 		dump_burst(8, "burst 3");
-		check_consecutive(8, "burst 3");
+		check_stream(8, "burst 3");
 
 		#1000;
 		if (errors == 0)
@@ -352,7 +364,7 @@ module spi_hw_stream_tb;
 
 	// safety net
 	initial begin
-		#2_000_000;
+		#((dut.FIFO_DEPTH * 4) * TICK_NS);
 		$display("FAIL: testbench timeout");
 		$finish;
 	end

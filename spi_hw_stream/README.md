@@ -11,17 +11,20 @@ needs (see [`../state_management.md`](../state_management.md)).
 
 ## What it does
 
-A free-running 8-bit counter increments at **500 kHz** and wraps `0xFF -> 0x00`.
-Each value is pushed into a 64-entry FIFO. A service state machine configures
-the hard IP, then keeps its transmit register loaded from the FIFO head, so
-every byte the master clocks out is the next value in the sequence.
+The ASCII string `"Hello World!"` (12 bytes, one character per byte, no
+terminator) is emitted one character per tick at **3 kHz** (`DATA_RATE_HZ`),
+wrapping from `!` back to `H`. Each character is pushed into a 64-entry FIFO.
+A service state machine configures the hard IP, then keeps its transmit
+register loaded from the FIFO head, so every byte the master clocks out is the
+next character of the message.
 
-**A working link looks like an unbroken incrementing byte stream** on the
-master/analyzer: `00 01 02 03 ...`.
+**A working link looks like the string repeating back-to-back** on the
+master/analyzer: `48 65 6c 6c 6f 20 57 6f 72 6c 64 21 48 65 ...` — an
+analyzer with ASCII decode shows `Hello World!Hello World!...`.
 
 Because this design keeps `SPITXDR` pre-loaded at all times, it matches
 FPGA-TN-02011 **Figure 15.1** (*iCE40 UltraPlus as SPI Slave*) — the pre-loaded
-byte goes straight to SO when CS asserts, so the counter appears from byte one.
+byte goes straight to SO when CS asserts, so the message appears from byte one.
 The dummy-byte overhead in Table 12.8 / Figure 15.2 applies to
 command-response protocols, where the slave can't know what to send until it
 decodes an incoming command. This design has nothing to decode.
@@ -30,7 +33,7 @@ decodes an incoming command. This design has nothing to decode.
 Figure 15.2 documents a *silicon limitation* there: the second byte out is
 forced to `0xFF` regardless of what you write, and good data only appears in
 the third byte period. That window exists at power-on (before the first
-500 kHz tick, ~2 µs) or any time the FIFO runs dry. If that's awkward,
+tick, ~333 µs at 3 kHz) or any time the FIFO runs dry. If that's awkward,
 `SPICR2[SDBRE]` (bit 5) makes it deterministic: `0xFF` until data is ready,
 then a single `0x00` marker, then the real stream — giving the master
 something to sync on.
@@ -47,7 +50,7 @@ lands on gpio_13 (the pin `host_to_spi.v` already uses for MISO).
 | SCK  | gpio_11 | FPGA in  | master supplies the clock |
 | CS   | gpio_19 | FPGA in  | active low |
 | MOSI | gpio_21 | FPGA in  | ignored by this test |
-| MISO | gpio_13 | FPGA out | the counter stream |
+| MISO | gpio_13 | FPGA out | the message stream |
 | flash CS | 16 | FPGA out | held high to keep the onboard flash off the bus |
 
 SPI mode 0 (CPOL=0, CPHA=0), **MSB-first** — matching `notes.md` and the rest
@@ -59,21 +62,24 @@ and the FTDI programmer off this bus. The cost is routing delay — see below.
 
 ## Rates, and why you will probably see drops
 
-The counter produces **500 kB/s**. The master only keeps up if it sustains
-**≥ 4 Mbit/s** of SPI clock. Below that the FIFO fills and new samples are
-**dropped** (drop-on-full — queued data is never overwritten or reordered).
+The message source produces **3 kB/s**. The master only keeps up if it
+sustains **≥ 24 kbit/s** of SPI clock (plus margin for gaps between
+transactions). Below that the FIFO fills and new characters are **dropped**
+(drop-on-full — queued data is never overwritten or reordered).
 
-Because the oldest samples are the ones kept, a slow master doesn't see a jump
-right after a stall — it sees a contiguous run of *stale* data and only hits
-the discontinuity once it drains the backlog. So:
+Because the oldest characters are the ones kept, a slow master doesn't see a
+skip right after a stall — it sees a contiguous run of *stale* data and only
+hits the discontinuity once it drains the backlog. So:
 
-- **Bytes increment by exactly 1** → link is working.
-- **Red LED on** → samples are being dropped, i.e. the master is too slow.
-  Expected below 4 Mbit/s; not a link fault.
-- **Bytes jump forward** → you drained the backlog and caught up to real time.
-- **`0xFF` runs / repeats / decrements** → something is actually wrong.
+- **The string repeats cleanly** (`...World!Hello...`) → link is working.
+- **Red LED on** → characters are being dropped, i.e. the master is too slow.
+  Expected below 24 kbit/s; not a link fault.
+- **The string skips forward mid-word** (`Hello Wold!`) → you drained the
+  backlog and caught up to real time.
+- **`0xFF` runs / repeated or garbled characters** → something is actually wrong.
 
-Drop `DATA_RATE_HZ` in the source if you want a rate a slow master can track.
+`DATA_RATE_HZ` in the source sets the rate; the 3 kHz here was chosen so a
+slow master can track it without drops.
 
 ## LEDs (active low)
 
@@ -93,8 +99,8 @@ make time    # static timing (icetime cannot analyze the SPI/HFOSC hard cells �
 make flash   # program over FTDI
 ```
 
-Current build: 1180 LC (22%), 1 of 2 `SB_SPI` blocks, no EBR. Core clock
-24 MHz, Fmax 35.6 MHz. The LC count is mostly the register-based FIFO's
+Current build: 1078 LC (20%), 1 of 2 `SB_SPI` blocks, no EBR. Core clock
+24 MHz, Fmax 35.5 MHz. The LC count is mostly the register-based FIFO's
 combinational read; moving it to an inferred EBR would cut it substantially at
 the cost of handling the read-during-write hazard.
 
@@ -132,8 +138,8 @@ behavior:
    register survives CS going high and is sent at the start of the next
    transaction. Figure 15.1 is consistent with that, but doesn't state it
    outright. If the real IP reloads from `SPITXDR` on every CS assertion,
-   you'll see one sample skipped per transaction — watch for a consistent +2
-   step at transaction boundaries.
+   you'll see one character skipped per transaction — watch for a missing
+   character at every transaction boundary.
 3. **Max usable SCK.** Two limits stack. The refill deadline (Table 12.8) gives
    ~7 bit-times to reload `SPITXDR`, against a ~375 ns worst-case service loop
    — fine below ~10 MHz. On top of that, the hard IP sits at chip corner (0,0)

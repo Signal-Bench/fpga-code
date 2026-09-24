@@ -6,17 +6,19 @@
  * and CS.  This is the opposite role from uart_to_spi.v, which bit-bangs a
  * soft SPI master out of fabric.
  *
- * Test payload: a free-running 8-bit counter incrementing at DATA_RATE_HZ
- * that wraps 0xFF -> 0x00.  Each value is pushed into a FIFO; the SPI service
- * state machine keeps the hard IP's transmit register loaded from the FIFO
- * head, so whatever byte the master clocks out is the next value in the
- * sequence.  A correctly working link shows a strictly incrementing byte
- * stream on the master side.
+ * Test payload: the ASCII string "Hello World!" (MSG_LEN = 12 bytes, one
+ * character per byte, no terminator), emitted one character per tick at
+ * DATA_RATE_HZ and wrapping from '!' back to 'H'.  Each character is pushed
+ * into a FIFO; the SPI service state machine keeps the hard IP's transmit
+ * register loaded from the FIFO head, so whatever byte the master clocks out
+ * is the next character of the message.  A correctly working link shows the
+ * string repeating back-to-back on the master side:
+ *   48 65 6c 6c 6f 20 57 6f 72 6c 64 21 48 65 ...
  *
  * Leading bytes: this design keeps SPITXDR pre-loaded at all times, which is
  * the "fully specified" case of FPGA-TN-02011 Figure 15.1 (iCE40 UltraPlus
  * as SPI Slave) — the pre-loaded byte goes straight to SO when CS asserts, so
- * the counter should appear from the very first byte.  The dummy-byte
+ * the message should appear from the very first byte.  The dummy-byte
  * overhead described in Table 12.8 / Figure 15.2 applies to command-response
  * protocols, where the slave cannot know what to send until it has decoded an
  * incoming command; this design has nothing to decode.
@@ -24,17 +26,19 @@
  * BUT if SPITXDR is empty when a transaction starts, Figure 15.2 documents a
  * silicon limitation: the second byte out is forced to 0xFF regardless, and
  * good data only appears in the third byte period.  That can happen here at
- * power-on (before the first 500 kHz tick lands, ~2 us) or any time the FIFO
- * runs dry.  SPICR2[SDBRE] turns that window into a deterministic
- * 0xFF.../0x00-marker/data framing instead — see the CFG_SPICR2 comment.
+ * power-on (before the first DATA_RATE_HZ tick lands, ~333 us at 3 kHz) or
+ * any time the FIFO runs dry.  SPICR2[SDBRE] turns that window into a
+ * deterministic 0xFF.../0x00-marker/data framing instead — see the
+ * CFG_SPICR2 comment.
  *
- * Producer/consumer rates: the counter produces DATA_RATE_HZ bytes/s, so the
- * master must sustain at least 8 * DATA_RATE_HZ bits/s of SPI clock to keep
- * up (3 Mbit/s at the current 375 kHz), plus margin for inter-transaction
- * gaps.  Below that the FIFO fills and new samples are DROPPED (drop-on-full,
- * never overwrite), which shows up on the master side as a forward jump in
- * the sequence rather than corrupted or out-of-order data.  The red LED flags
- * that this is happening.
+ * Producer/consumer rates: the message source produces DATA_RATE_HZ bytes/s,
+ * so the master must sustain at least 8 * DATA_RATE_HZ bits/s of SPI clock to
+ * keep up (24 kbit/s at the current 3 kHz), plus margin for inter-transaction
+ * gaps.  Below that the FIFO fills and new characters are DROPPED
+ * (drop-on-full, never overwrite), which shows up on the master side as a
+ * skip forward within the message (e.g. "Hello Wo" then "rld!" missing) rather
+ * than corrupted or out-of-order data.  The red LED flags that this is
+ * happening.
  *
  * Debug LEDs (active low on the UPduino):
  *   RED:   pulses when a sample was dropped (FIFO full — master too slow)
@@ -45,7 +49,7 @@ module top (
 	input  wire spi_sck,       // gpio_11 — SCK in from master
 	input  wire spi_cs,        // gpio_19 — CS in from master (active low)
 	input  wire spi_mosi,      // gpio_21 — MOSI in from master (ignored here)
-	output wire spi_miso,      // gpio_13 — MISO out to master (counter stream)
+	output wire spi_miso,      // gpio_13 — MISO out to master (message stream)
 	output wire spi_cs_flash,  // pin 16  — hold the onboard flash deselected
 	output wire led_r,
 	output wire led_g,
@@ -87,19 +91,32 @@ module top (
 		tick_ctr <= tick ? {TICK_W{1'b0}} : tick_ctr + 1'b1;
 
 	// ----------------------------------------------------------------
+	// Test message
+	//
+	// A Verilog string literal packs its first character into the most
+	// significant byte, so character i lives at bits [8*(MSG_LEN-1-i) +: 8].
+	// msg_idx walks 0 .. MSG_LEN-1 and wraps, one step per tick.
+	// ----------------------------------------------------------------
+	localparam integer          MSG_LEN = 12;
+	localparam [8*MSG_LEN-1:0]  MSG     = "Hello World!";
+	localparam integer          MSG_IW  = $clog2(MSG_LEN);
+
+	reg  [MSG_IW-1:0] msg_idx  = 0;
+	wire [7:0]        msg_byte = MSG[8*(MSG_LEN-1-msg_idx) +: 8];
+
+	// ----------------------------------------------------------------
 	// Test-pattern FIFO
 	//
 	// Register-based with a combinational read of the head, deliberately
 	// NOT an inferred EBR: the read-during-write hazard of a synchronous
 	// RAM read would need an extra guard, and keeping the EBRs free
 	// matters for the real capture design.  64 entries buys FIFO_DEPTH /
-	// DATA_RATE_HZ of buffering (171 us at 375 kHz); bump FIFO_AW if you
+	// DATA_RATE_HZ of buffering (21 ms at 3 kHz); bump FIFO_AW if you
 	// need to absorb longer gaps between master reads.
 	// ----------------------------------------------------------------
 	localparam integer FIFO_AW    = 6;
 	localparam integer FIFO_DEPTH = 1 << FIFO_AW;   // 64
 
-	reg  [7:0]         data_counter = 8'd0;
 	reg  [7:0]         fifo_mem [0:FIFO_DEPTH-1];
 	reg  [FIFO_AW-1:0] fifo_wr    = 0;
 	reg  [FIFO_AW-1:0] fifo_rd    = 0;
@@ -115,10 +132,10 @@ module top (
 
 	always @(posedge clk_core) begin
 		if (tick)
-			data_counter <= data_counter + 8'd1;
+			msg_idx <= (msg_idx == MSG_LEN - 1) ? {MSG_IW{1'b0}} : msg_idx + 1'b1;
 
 		if (fifo_push) begin
-			fifo_mem[fifo_wr] <= data_counter;
+			fifo_mem[fifo_wr] <= msg_byte;
 			fifo_wr           <= fifo_wr + 1'b1;
 		end
 
