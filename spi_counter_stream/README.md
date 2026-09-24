@@ -1,4 +1,4 @@
-# spi_counter_stream — hard SPI IP slave bring-up test
+# spi_counter_stream — selectable SPI stream bring-up test
 
 Exercises the iCE40 UP5K's **hardened SPI block** (`SB_SPI`) configured as a
 **slave**, streaming a known test pattern so you can confirm the IP works
@@ -10,26 +10,35 @@ This is the first design in the repo where the FPGA is the SPI *slave* —
 needs (see [`../state_management.md`](../state_management.md)).
 
 Relationship to [`../spi_hw_stream/`](../spi_hw_stream/): same design. This
-directory keeps the **ascending-byte-counter** payload, which is the better
-link-integrity test — a missed, repeated, or reordered byte is visible
-immediately. `spi_hw_stream/` has since had its payload replaced with a
-repeating `"Hello World!"` string, which is easier to eyeball in a terminal but
-much weaker as a check.
+directory now combines both human-readable test payloads: ascending printable
+ASCII and `"Hello World!"`. The MCU selects between them with a mode command.
+`spi_hw_stream/` remains the original fixed-message image.
 
 ## What it does
 
-An 8-bit counter is produced at up to **`DATA_RATE_HZ` (currently 3 kHz)** and
-wraps `0xFF -> 0x00`. It pauses while FIFO backpressure is active.
-Each value is pushed into a 64-entry FIFO. A service state machine configures
-the hard IP, then keeps its transmit register loaded from the FIFO head, so
-every byte the master clocks out is the next value in the sequence.
+The default payload is printable ASCII from space (`0x20`) through `~` (`0x7E`),
+followed by LF and repeated. The alternate payload is `"Hello World!\n"`.
+Bytes are produced at up to **`DATA_RATE_HZ` (currently 3 kHz)** and pause while
+FIFO backpressure is active. A service state machine keeps the hard IP's
+transmit register loaded from the FIFO or a pending command response.
 
-**A working link looks like an unbroken incrementing byte stream** on the
-master/analyzer: `00 01 02 03 ...`.
+The command transaction and response transaction are separate:
+
+```text
+MCU -> FPGA: 53 42 4D 01    select ascending ASCII
+FPGA -> MCU: 53 42 41 01
+
+MCU -> FPGA: 53 42 4D 02    select Hello World
+FPGA -> MCU: 53 42 41 02
+```
+
+The ready command `53 42 A5 5A` similarly returns `53 42 4F 4B`. Responses
+take priority at the start of the follow-up transfer; one already-prefetched
+stream byte may precede the ACK.
 
 Because this design keeps `SPITXDR` pre-loaded at all times, it matches
 FPGA-TN-02011 **Figure 15.1** (*iCE40 UltraPlus as SPI Slave*) — the pre-loaded
-byte goes straight to SO when CS asserts, so the counter appears from byte one.
+byte goes straight to SO when CS asserts, so the stream appears from byte one.
 The dummy-byte overhead in Table 12.8 / Figure 15.2 applies to
 command-response protocols, where the slave can't know what to send until it
 decodes an incoming command. This design has nothing to decode.
@@ -55,7 +64,7 @@ lands on gpio_13 (the pin `host_to_spi.v` already uses for MISO).
 | SCK  | gpio_11 | FPGA in  | master supplies the clock |
 | CS   | gpio_19 | FPGA in  | active low |
 | MOSI | gpio_21 | FPGA in  | ignored by this test |
-| MISO | gpio_13 | FPGA out | the counter stream |
+| MISO | gpio_13 | FPGA out | test stream and command ACKs |
 | flash CS | 16 | FPGA out | held high to keep the onboard flash off the bus |
 
 SPI mode 0 (CPOL=0, CPHA=0), **MSB-first** — matching `notes.md` and the rest
@@ -67,17 +76,18 @@ and the FTDI programmer off this bus. The cost is routing delay — see below.
 
 ## Rates and backpressure
 
-The counter produces `DATA_RATE_HZ` bytes/s — **3 kB/s** at the current
+The selected pattern produces `DATA_RATE_HZ` bytes/s — **3 kB/s** at the current
 setting. The master only keeps up if it sustains **≥ 8 × `DATA_RATE_HZ`**
 bits/s of SPI clock (**24 kbit/s** at 3 kHz). Below that the FIFO fills and new
 samples pause. Queued data is never overwritten or reordered, and the
-synthetic counter does not advance until FIFO space is available.
+synthetic source does not advance until FIFO space is available.
 
 Because this is a link-integrity generator rather than a real-time capture
 source, backpressure preserves a consecutive sequence. So:
 
-- **Bytes increment by exactly 1** → link is working.
-- **Red LED on** → the counter is paused because the master is too slow.
+- **ASCII advances from space through `~`, then LF** → link is working.
+- **`Hello World!` lines repeat** → alternate mode is working.
+- **Red LED on** → the source is paused because the master is too slow.
 - **Bytes jump forward** → the SPI path lost or skipped a byte.
 - **`0xFF` runs / repeats / decrements** → something is actually wrong.
 
@@ -88,7 +98,8 @@ via `$clog2`, and the testbench scales its own wait windows off `dut.TICK_DIV`
 tick counter at 6 bits, which silently pinned the usable rate at ≥ 375 kHz:
 below that the compare value was unreachable and the tick never fired at all,
 so editing `DATA_RATE_HZ` appeared to do nothing.) Verified in simulation from
-500 Hz to 2 MHz.
+500 Hz to 2 MHz in the original counter-only simulation. The current testbench
+also verifies ready/mode ACKs and both selectable payloads.
 
 ## LEDs (active low)
 
@@ -96,22 +107,20 @@ so editing `DATA_RATE_HZ` appeared to do nothing.) Verified in simulation from
 |---|---|
 | GREEN | hard SPI IP finished configuring (should light immediately at power-on) |
 | BLUE  | pulses when a byte is handed to the IP — master is clocking |
-| RED   | pulses while FIFO backpressure stalls the counter |
+| RED   | pulses while FIFO backpressure stalls the source |
 
 ## Commands
 
 ```
-make sim     # testbench: verifies sequencing, backpressure, and CS-boundary continuity
+make sim     # verifies sequencing, backpressure, commands, ACKs, and both modes
 make wave    # same, with a GTKWave dump
 make build   # bitstream
 make time    # static timing (icetime cannot analyze the SPI/HFOSC hard cells — expected warnings)
 make flash   # program over FTDI
 ```
 
-Current build: 1180 LC (22%), 1 of 2 `SB_SPI` blocks, no EBR. Core clock
-24 MHz, Fmax 35.6 MHz. The LC count is mostly the register-based FIFO's
-combinational read; moving it to an inferred EBR would cut it substantially at
-the cost of handling the read-during-write hazard.
+The last counter-only build used 1180 LC (22%), 1 of 2 `SB_SPI` blocks, and no
+EBR. Re-run `make build` for utilization and timing after adding command decode.
 
 ## Register settings, verified against the datasheet
 

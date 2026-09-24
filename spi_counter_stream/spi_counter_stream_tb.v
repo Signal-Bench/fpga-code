@@ -177,6 +177,7 @@ module spi_counter_stream_tb;
 	integer errors = 0;
 
 	localparam integer HALF = 250;   // ns -> 2 MHz SCK
+	localparam [8*13-1:0] HELLO_LINE = "Hello World!\n";
 
 	// Every wait below is expressed in SAMPLE periods, derived from the DUT's
 	// own TICK_DIV, so changing DATA_RATE_HZ in the design re-times the whole
@@ -207,6 +208,7 @@ module spi_counter_stream_tb;
 			for (i = 0; i < n; i = i + 1) begin
 				rx = 8'h00;
 				for (b = 7; b >= 0; b = b - 1) begin
+					spi_mosi = 1'b0;
 					spi_sck = 1'b1;
 					#1;
 					rx[b] = spi_miso;    // master samples on the rising edge
@@ -217,6 +219,36 @@ module spi_counter_stream_tb;
 				burst[i] = rx;
 			end
 			spi_cs = 1'b1;
+			spi_mosi = 1'b0;
+			#(HALF);
+		end
+	endtask
+
+	// Send one four-byte protocol command. Its simultaneous MISO data is stream
+	// payload; the response is intentionally read in a following transaction.
+	task spi_command(input [7:0] opcode, input [7:0] argument);
+		integer i, b;
+		reg [7:0] tx;
+		begin
+			spi_cs = 1'b0;
+			#(HALF);
+			for (i = 0; i < 4; i = i + 1) begin
+				case (i)
+					0: tx = 8'h53;
+					1: tx = 8'h42;
+					2: tx = opcode;
+					default: tx = argument;
+				endcase
+				for (b = 7; b >= 0; b = b - 1) begin
+					spi_mosi = tx[b];
+					spi_sck = 1'b1;
+					#(HALF);
+					spi_sck = 1'b0;
+					#(HALF);
+				end
+			end
+			spi_cs = 1'b1;
+			spi_mosi = 1'b0;
 			#(HALF);
 		end
 	endtask
@@ -231,6 +263,81 @@ module spi_counter_stream_tb;
 				if (burst[i] !== expect_next) begin
 					$display("FAIL [%0s]: byte %0d = 0x%02x, expected 0x%02x (prev 0x%02x)",
 					         label, i, burst[i], expect_next, burst[i-1]);
+					errors = errors + 1;
+				end
+			end
+		end
+	endtask
+
+	task check_mode_ack(input [7:0] mode, input [127:0] label);
+		integer i;
+		integer found;
+		begin
+			found = 0;
+			for (i = 0; i <= 12; i = i + 1)
+				if (burst[i] === 8'h53 && burst[i+1] === 8'h42 &&
+				    burst[i+2] === 8'h41 && burst[i+3] === mode)
+					found = 1;
+			if (!found) begin
+				$display("FAIL [%0s]: mode ACK 53 42 41 %02x not found", label, mode);
+				errors = errors + 1;
+			end
+		end
+	endtask
+
+	task check_ready_ack;
+		integer i;
+		integer found;
+		begin
+			found = 0;
+			for (i = 0; i <= 12; i = i + 1)
+				if (burst[i] === 8'h53 && burst[i+1] === 8'h42 &&
+				    burst[i+2] === 8'h4F && burst[i+3] === 8'h4B)
+					found = 1;
+			if (!found) begin
+				$display("FAIL: ready ACK 53 42 4f 4b not found");
+				errors = errors + 1;
+			end
+		end
+	endtask
+
+	task check_hello_present(input integer n);
+		integer i, j;
+		integer found;
+		integer matches;
+		reg [7:0] expected;
+		begin
+			found = 0;
+			for (i = 0; i <= n - 13; i = i + 1) begin
+				matches = 1;
+				for (j = 0; j < 13; j = j + 1) begin
+					expected = HELLO_LINE[8*(12-j) +: 8];
+					if (burst[i+j] !== expected)
+						matches = 0;
+				end
+				if (matches)
+					found = 1;
+			end
+			if (!found) begin
+				$display("FAIL: Hello World line not found after mode switch");
+				errors = errors + 1;
+			end
+		end
+	endtask
+
+	task check_ascii_sequence(input integer n);
+		integer i;
+		reg [7:0] expected;
+		begin
+			for (i = 1; i < n; i = i + 1) begin
+				if (burst[i-1] == 8'h7E)
+					expected = 8'h0A;
+				else if (burst[i-1] == 8'h0A)
+					expected = 8'h20;
+				else
+					expected = burst[i-1] + 1'b1;
+				if (burst[i] !== expected) begin
+					$display("FAIL [ASCII mode]: byte %0d = %02x, expected %02x", i, burst[i], expected);
 					errors = errors + 1;
 				end
 			end
@@ -257,7 +364,7 @@ module spi_counter_stream_tb;
 		if (dut.source_stalled) stall_count = stall_count + 1;
 
 	// Total samples produced, in a width that does not wrap.  The design's own
-	// data_counter is 8 bits, so measuring how far the master has fallen behind
+	// ascii_char is 8 bits, so measuring how far the master has fallen behind
 	// with it aliases as soon as the stall exceeds 256 samples — which is what
 	// happens at high DATA_RATE_HZ.  Count ticks here instead.
 	integer tick_count = 0;
@@ -291,12 +398,12 @@ module spi_counter_stream_tb;
 
 		// ------------------------------------------------------------
 		// Test 1: with backlog available and no drops, the master must
-		// see a strictly incrementing sequence starting from 0x00.
+		// see a strictly incrementing sequence starting from ASCII space.
 		// ------------------------------------------------------------
 		spi_burst(16);
 		dump_burst(16, "burst 1");
-		if (burst[0] !== 8'h00) begin
-			$display("FAIL: first streamed byte = 0x%02x, expected 0x00", burst[0]);
+		if (burst[0] !== 8'h20) begin
+			$display("FAIL: first streamed byte = 0x%02x, expected 0x20", burst[0]);
 			errors = errors + 1;
 		end
 		check_consecutive(16, "burst 1");
@@ -327,11 +434,11 @@ module spi_counter_stream_tb;
 			$display("FAIL: red LED not lit — FIFO backpressure never signalled");
 			errors = errors + 1;
 		end
-		counter_before_stall = dut.data_counter;
+		counter_before_stall = dut.ascii_char;
 		#(8 * SAMPLE_NS);
-		if (dut.data_counter !== counter_before_stall) begin
+		if (dut.ascii_char !== counter_before_stall) begin
 			$display("FAIL: counter advanced while FIFO was full (0x%02x -> 0x%02x)",
-			         counter_before_stall, dut.data_counter);
+			         counter_before_stall, dut.ascii_char);
 			errors = errors + 1;
 		end
 		$display("  stall window: %0d blocked samples, fifo_count = %0d",
@@ -352,7 +459,7 @@ module spi_counter_stream_tb;
 
 		// ...and the master should be reading data well behind the live
 		// counter, which is what "the master is too slow" actually looks like.
-		// Measured off the non-wrapping tick count, not the 8-bit data_counter.
+		// Measured off the non-wrapping tick count, not the 8-bit source state.
 		lag_samples = tick_count - ticks_before;
 		if (lag_samples < dut.FIFO_DEPTH) begin
 			$display("FAIL: expected the master to lag the live counter by at least %0d samples, got %0d",
@@ -370,6 +477,34 @@ module spi_counter_stream_tb;
 		spi_burst(8);
 		dump_burst(8, "burst 3");
 		check_consecutive(8, "burst 3");
+
+		spi_command(8'hA5, 8'h5A);
+		#5000;
+		spi_burst(16);
+		dump_burst(16, "ready ACK");
+		check_ready_ack;
+
+		// DIO is temporarily the Hello World test-pattern selector.
+		spi_command(8'h4D, 8'h02);
+		#5000;
+		spi_burst(16);
+		dump_burst(16, "hello ACK");
+		check_mode_ack(8'h02, "hello");
+		#(24 * SAMPLE_NS);
+		spi_burst(32);
+		dump_burst(32, "hello stream");
+		check_hello_present(32);
+
+		// SPI selects ascending printable ASCII again.
+		spi_command(8'h4D, 8'h01);
+		#5000;
+		spi_burst(16);
+		dump_burst(16, "ASCII ACK");
+		check_mode_ack(8'h01, "ASCII");
+		#(24 * SAMPLE_NS);
+		spi_burst(16);
+		dump_burst(16, "ASCII stream");
+		check_ascii_sequence(16);
 
 		#1000;
 		if (errors == 0)

@@ -8,7 +8,7 @@ testbenches and documentation to describe FIFO backpressure accurately.
 
 These changes apply to:
 
-- `spi_counter_stream`: ascending byte counter
+- `spi_counter_stream`: selectable ascending ASCII / `Hello World!` stream
 - `spi_hw_stream`: repeating `Hello World!` message
 
 ## Problem
@@ -38,6 +38,8 @@ nominal read capacity from 3.2 kB/s to 6.4 kB/s for the 3 kB/s test source.
 - Update both READMEs to distinguish source backpressure from transport loss.
 - Add simulation assertions that the source does not advance while full.
 - Document the ESP32-H2 sample-edge requirement found during hardware testing.
+- Add ready/mode command decoding and follow-up transaction ACKs.
+- Map SPI mode to ascending printable ASCII and DIO mode to `Hello World!`.
 
 With this behavior, a counter jump or skipped message character is evidence
 of a transport or hard-SPI issue rather than an intentional generator drop.
@@ -56,10 +58,10 @@ stalling, buffered-data integrity, and continuity across chip-select toggles.
 
 ## Remaining Limitation
 
-These are stream-only bring-up images. Their MOSI data is drained to prevent
-receive overrun but is not decoded, so they do not implement the SignalBench
-ready handshake or protocol-selection commands. A mode must not be considered
-selected unless a future command-capable FPGA image returns a valid ACK.
+`spi_counter_stream` now decodes the ready command and the temporary SPI/DIO
+test-pattern mode commands. `spi_hw_stream` remains stream-only and ignores
+MOSI. A mode is considered selected only after the command-capable image
+returns a valid ACK in the follow-up transaction.
 
 The behavioral `SB_SPI` model is not silicon-accurate. Final validation still
 requires synthesizing the bitstream and checking the stream on the target

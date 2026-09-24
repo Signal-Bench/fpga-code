@@ -6,20 +6,17 @@
  * and CS.  This is the opposite role from uart_to_spi.v, which bit-bangs a
  * soft SPI master out of fabric.
  *
- * Test payload: an 8-bit counter produced at up to DATA_RATE_HZ that wraps
- * 0xFF -> 0x00. Each value is pushed into a FIFO; the SPI service
- * state machine keeps the hard IP's transmit register loaded from the FIFO
- * head, so whatever byte the master clocks out is the next value in the
- * sequence.  A correctly working link shows a strictly incrementing byte
- * stream on the master side.
+ * Test payload: ascending printable ASCII (space through '~', then LF) or
+ * "Hello World!" followed by LF. SPI mode-select commands switch between the
+ * two patterns and receive a four-byte acknowledgement on the next transfer.
  *
  * Leading bytes: this design keeps SPITXDR pre-loaded at all times, which is
  * the "fully specified" case of FPGA-TN-02011 Figure 15.1 (iCE40 UltraPlus
  * as SPI Slave) — the pre-loaded byte goes straight to SO when CS asserts, so
- * the counter should appear from the very first byte.  The dummy-byte
- * overhead described in Table 12.8 / Figure 15.2 applies to command-response
- * protocols, where the slave cannot know what to send until it has decoded an
- * incoming command; this design has nothing to decode.
+ * the stream should appear from the very first byte.  The dummy-byte
+ * overhead described in Table 12.8 / Figure 15.2 applies to responses that
+ * cannot be known until an incoming command has been decoded. This design
+ * therefore returns command ACKs in a separate follow-up transaction.
  *
  * BUT if SPITXDR is empty when a transaction starts, Figure 15.2 documents a
  * silicon limitation: the second byte out is forced to 0xFF regardless, and
@@ -29,10 +26,10 @@
  * runs dry.  SPICR2[SDBRE] turns that window into a deterministic
  * 0xFF.../0x00-marker/data framing instead — see the CFG_SPICR2 comment.
  *
- * Producer/consumer rates: the counter produces DATA_RATE_HZ bytes/s, so the
+ * Producer/consumer rates: the source produces DATA_RATE_HZ bytes/s, so the
  * master must sustain at least 8 * DATA_RATE_HZ bits/s of SPI clock to keep
  * up (24 kbit/s at the current 3 kHz), plus margin for inter-transaction
- * gaps.  If the FIFO fills, the synthetic counter pauses until space becomes
+ * gaps.  If the FIFO fills, the synthetic source pauses until space becomes
  * available.  This keeps the test stream consecutive so any observed jump is
  * attributable to the SPI path rather than the pattern generator itself.
  *
@@ -44,8 +41,8 @@
 module top (
 	input  wire spi_sck,       // gpio_11 — SCK in from master
 	input  wire spi_cs,        // gpio_19 — CS in from master (active low)
-	input  wire spi_mosi,      // gpio_21 — MOSI in from master (ignored here)
-	output wire spi_miso,      // gpio_13 — MISO out to master (counter stream)
+	input  wire spi_mosi,      // gpio_21 — commands in from master
+	output wire spi_miso,      // gpio_13 — MISO out to master (test stream / ACK)
 	output wire spi_cs_flash,  // pin 16  — hold the onboard flash deselected
 	output wire led_r,
 	output wire led_g,
@@ -87,7 +84,7 @@ module top (
 		tick_ctr <= tick ? {TICK_W{1'b0}} : tick_ctr + 1'b1;
 
 	// ----------------------------------------------------------------
-	// Test-pattern FIFO
+	// Selectable test-pattern source
 	//
 	// Register-based with a combinational read of the head, deliberately
 	// NOT an inferred EBR: the read-during-write hazard of a synchronous
@@ -99,7 +96,16 @@ module top (
 	localparam integer FIFO_AW    = 6;
 	localparam integer FIFO_DEPTH = 1 << FIFO_AW;   // 64
 
-	reg  [7:0]         data_counter = 8'd0;
+	localparam integer          MSG_LEN = 13;
+	localparam [8*MSG_LEN-1:0]  MSG     = "Hello World!\n";
+	localparam integer          MSG_IW  = $clog2(MSG_LEN);
+
+	reg                        mode_hello = 1'b0;
+	reg  [7:0]                 ascii_char = 8'h20;
+	reg  [MSG_IW-1:0]          msg_idx = 0;
+	wire [7:0]                 msg_byte = MSG[8*(MSG_LEN-1-msg_idx) +: 8];
+	wire [7:0]                 source_byte = mode_hello ? msg_byte : ascii_char;
+
 	reg  [7:0]         fifo_mem [0:FIFO_DEPTH-1];
 	reg  [FIFO_AW-1:0] fifo_wr    = 0;
 	reg  [FIFO_AW-1:0] fifo_rd    = 0;
@@ -109,26 +115,41 @@ module top (
 	wire       fifo_empty = (fifo_count == 0);
 	wire [7:0] fifo_head  = fifo_mem[fifo_rd];
 
-	wire fifo_push = tick & ~fifo_full;
+	reg  mode_switch = 1'b0;
+	wire fifo_push = tick & ~fifo_full & ~mode_switch;
 	wire source_stalled = tick & fifo_full;
 	reg  fifo_pop;   // single-cycle pulse, driven by the SPI service FSM
 
 	always @(posedge clk_core) begin
-		if (fifo_push) begin
-			fifo_mem[fifo_wr] <= data_counter;
-			fifo_wr           <= fifo_wr + 1'b1;
-			data_counter      <= data_counter + 8'd1;
+		if (mode_switch) begin
+			fifo_wr    <= 0;
+			fifo_rd    <= 0;
+			fifo_count <= 0;
+			ascii_char <= 8'h20;
+			msg_idx    <= 0;
+		end else begin
+			if (fifo_push) begin
+				fifo_mem[fifo_wr] <= source_byte;
+				fifo_wr           <= fifo_wr + 1'b1;
+				if (mode_hello)
+					msg_idx <= (msg_idx == MSG_LEN - 1) ? {MSG_IW{1'b0}} : msg_idx + 1'b1;
+				else if (ascii_char == 8'h7E)
+					ascii_char <= 8'h0A;
+				else if (ascii_char == 8'h0A)
+					ascii_char <= 8'h20;
+				else
+					ascii_char <= ascii_char + 1'b1;
+			end
+
+			if (fifo_pop)
+				fifo_rd <= fifo_rd + 1'b1;
+
+			case ({fifo_push, fifo_pop})
+				2'b10:   fifo_count <= fifo_count + 1'b1;
+				2'b01:   fifo_count <= fifo_count - 1'b1;
+				default: fifo_count <= fifo_count;
+			endcase
 		end
-
-		if (fifo_pop)
-			fifo_rd <= fifo_rd + 1'b1;
-
-		// push and pop can land in the same cycle
-		case ({fifo_push, fifo_pop})
-			2'b10:   fifo_count <= fifo_count + 1'b1;
-			2'b01:   fifo_count <= fifo_count - 1'b1;
-			default: fifo_count <= fifo_count;
-		endcase
 	end
 
 	// ----------------------------------------------------------------
@@ -213,6 +234,28 @@ module top (
 	// and declare spi_miso as inout.
 	assign spi_miso = so_data;
 
+	// Commands are sent in one transaction; responses are shifted out at the
+	// front of the following transaction because an SPI slave cannot answer a
+	// byte before receiving it. SPI mode selects ascending ASCII, while DIO
+	// selects Hello World for this temporary two-pattern bring-up image.
+	localparam [7:0] PROTO_MAGIC_0  = 8'h53,
+	                 PROTO_MAGIC_1  = 8'h42,
+	                 PROTO_READY_0  = 8'hA5,
+	                 PROTO_READY_1  = 8'h5A,
+	                 PROTO_MODE_CMD = 8'h4D,
+	                 PROTO_READY_0_ACK = 8'h4F,
+	                 PROTO_READY_1_ACK = 8'h4B,
+	                 PROTO_MODE_ACK = 8'h41,
+	                 MODE_ASCII = 8'h01,
+	                 MODE_HELLO = 8'h02;
+
+	reg [1:0]  command_pos = 0;
+	reg [7:0]  command_opcode = 0;
+	reg [31:0] response_word = 0;
+	reg [2:0]  response_count = 0;
+	wire [7:0] response_byte = response_word[31:24];
+	wire       response_pending = (response_count != 0);
+
 	// ----------------------------------------------------------------
 	// Service state machine: configure the IP, then keep its transmit
 	// register fed from the FIFO and drain its receive register so the
@@ -240,6 +283,7 @@ module top (
 	always @(posedge clk_core) begin
 		spi_stb  <= 1'b0;
 		fifo_pop <= 1'b0;
+		mode_switch <= 1'b0;
 
 		case (state)
 			// -- configuration writes --
@@ -275,7 +319,7 @@ module top (
 				spi_stb <= 1'b1; spi_rw <= 1'b0;
 				if (spi_ack) begin
 					spi_stb <= 1'b0;
-					if (spi_dato[SR_TRDY] && !fifo_empty)
+					if (spi_dato[SR_TRDY] && (response_pending || !fifo_empty))
 						state <= S_LOAD_TX;
 					else if (spi_dato[SR_RRDY])
 						state <= S_DRAIN_RX;
@@ -285,19 +329,60 @@ module top (
 			end
 
 			S_LOAD_TX: begin
-				spi_adr <= ADDR_SPITXDR; spi_dati <= fifo_head;
+				spi_adr <= ADDR_SPITXDR;
+				spi_dati <= response_pending ? response_byte : fifo_head;
 				spi_stb <= 1'b1; spi_rw <= 1'b1;
 				if (spi_ack) begin
-					spi_stb  <= 1'b0;
-					fifo_pop <= 1'b1;   // byte now belongs to the IP
-					state    <= S_POLL;
+					spi_stb <= 1'b0;
+					if (response_pending) begin
+						response_word  <= {response_word[23:0], 8'h00};
+						response_count <= response_count - 1'b1;
+					end else begin
+						fifo_pop <= 1'b1;
+					end
+					state <= S_POLL;
 				end
 			end
 
 			S_DRAIN_RX: begin
 				spi_adr <= ADDR_SPIRXDR;
 				spi_stb <= 1'b1; spi_rw <= 1'b0;
-				if (spi_ack) begin spi_stb <= 1'b0; state <= S_POLL; end
+				if (spi_ack) begin
+					spi_stb <= 1'b0;
+					state <= S_POLL;
+					case (command_pos)
+						2'd0: begin
+							if (spi_dato == PROTO_MAGIC_0)
+								command_pos <= 2'd1;
+						end
+						2'd1: begin
+							command_pos <= (spi_dato == PROTO_MAGIC_1) ? 2'd2 : 2'd0;
+						end
+						2'd2: begin
+							if (spi_dato == PROTO_READY_0 || spi_dato == PROTO_MODE_CMD) begin
+								command_opcode <= spi_dato;
+								command_pos <= 2'd3;
+							end else begin
+								command_pos <= 2'd0;
+							end
+						end
+						2'd3: begin
+							command_pos <= 2'd0;
+							if (command_opcode == PROTO_READY_0 && spi_dato == PROTO_READY_1) begin
+								response_word <= {PROTO_MAGIC_0, PROTO_MAGIC_1,
+								                  PROTO_READY_0_ACK, PROTO_READY_1_ACK};
+								response_count <= 3'd4;
+							end else if (command_opcode == PROTO_MODE_CMD &&
+							             (spi_dato == MODE_ASCII || spi_dato == MODE_HELLO)) begin
+								mode_hello <= (spi_dato == MODE_HELLO);
+								mode_switch <= 1'b1;
+								response_word <= {PROTO_MAGIC_0, PROTO_MAGIC_1,
+								                  PROTO_MODE_ACK, spi_dato};
+								response_count <= 3'd4;
+							end
+						end
+					endcase
+				end
 			end
 
 			default: state <= S_CR0;
