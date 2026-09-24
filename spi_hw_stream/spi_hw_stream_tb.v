@@ -192,7 +192,7 @@ module spi_hw_stream_tb;
 	// Position in the endless "Hello World!Hello World!..." stream that the
 	// next byte off the link must correspond to.  Advances with every byte
 	// read, across bursts — the stream must stay continuous through CS
-	// toggles and through a drop-on-full stall.
+	// toggles and through a FIFO-full stall.
 	integer stream_pos = 0;
 
 	top dut (
@@ -258,11 +258,12 @@ module spi_hw_stream_tb;
 		end
 	endtask
 
-	// Count dropped samples straight off the design's internal strobe.
-	integer drop_count = 0;
-	integer drops_before = 0;
+	// Count source stalls straight off the design's internal strobe.
+	integer stall_count = 0;
+	integer stalls_before = 0;
+	reg [dut.MSG_IW-1:0] msg_idx_before_stall;
 	always @(posedge dut.clk_core)
-		if (dut.sample_dropped) drop_count = drop_count + 1;
+		if (dut.source_stalled) stall_count = stall_count + 1;
 
 	initial begin
 		if ($test$plusargs("vcd")) begin
@@ -296,42 +297,43 @@ module spi_hw_stream_tb;
 		check_stream(16, "burst 1");
 
 		// ------------------------------------------------------------
-		// Test 2: stop reading long enough for the FIFO to fill and start
-		// dropping (FIFO_DEPTH ticks to fill, then some margin).
+		// Test 2: stop reading long enough for the FIFO to fill and stall the
+		// synthetic source (FIFO_DEPTH ticks to fill, then some margin).
 		//
-		// Note on what overflow looks like from the master's side: because
-		// the policy is drop-on-full, the FIFO keeps the OLDEST characters
-		// and discards new ones, so the master does NOT see a skip right
-		// after the stall — it sees a contiguous run of stale data and only
-		// hits the discontinuity once it has drained the backlog.  With a
-		// master slower than DATA_RATE_HZ it never drains, so the skip never
-		// surfaces.  The drop mechanism is therefore checked directly rather
-		// than inferred from the byte stream.
+		// The source must stop advancing while full. Otherwise this test
+		// generator creates the same message gaps it is intended to detect.
 		// ------------------------------------------------------------
-		drops_before = drop_count;
-		#((dut.FIFO_DEPTH + 16) * TICK_NS);   // full FIFO plus 16 dropped
+		stalls_before = stall_count;
+		#((dut.FIFO_DEPTH + 16) * TICK_NS);   // full FIFO plus 16 blocked ticks
 
 		if (dut.fifo_count !== dut.FIFO_DEPTH) begin
 			$display("FAIL: FIFO not full after stall (count = %0d, expected %0d)",
 			         dut.fifo_count, dut.FIFO_DEPTH);
 			errors = errors + 1;
 		end
-		if (drop_count <= drops_before) begin
-			$display("FAIL: no samples dropped during the stall window");
+		if (stall_count <= stalls_before) begin
+			$display("FAIL: source was not stalled while the FIFO was full");
 			errors = errors + 1;
 		end
 		if (led_r !== 1'b0) begin
-			$display("FAIL: red LED not lit — drop-on-full never signalled");
+			$display("FAIL: red LED not lit — FIFO backpressure never signalled");
 			errors = errors + 1;
 		end
-		$display("  stall window: %0d samples dropped, fifo_count = %0d",
-		         drop_count - drops_before, dut.fifo_count);
+		msg_idx_before_stall = dut.msg_idx;
+		#(8 * TICK_NS);
+		if (dut.msg_idx !== msg_idx_before_stall) begin
+			$display("FAIL: message source advanced while FIFO was full (%0d -> %0d)",
+			         msg_idx_before_stall, dut.msg_idx);
+			errors = errors + 1;
+		end
+		$display("  stall window: %0d blocked characters, fifo_count = %0d",
+		         stall_count - stalls_before, dut.fifo_count);
 
 		spi_burst(16);
 		dump_burst(16, "burst 2");
 
-		// Buffered data must survive the overflow intact and pick up exactly
-		// where burst 1 stopped — drop-on-full must never corrupt or reorder
+		// Buffered data must survive backpressure intact and pick up exactly
+		// where burst 1 stopped. A full FIFO must never corrupt or reorder
 		// what is already queued.
 		check_stream(16, "burst 2");
 

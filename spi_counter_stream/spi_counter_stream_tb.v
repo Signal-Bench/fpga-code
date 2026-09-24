@@ -249,11 +249,12 @@ module spi_counter_stream_tb;
 	reg [7:0] last_of_burst1;
 	integer   lag_samples;
 
-	// Count dropped samples straight off the design's internal strobe.
-	integer drop_count = 0;
-	integer drops_before = 0;
+	// Count source stalls straight off the design's internal strobe.
+	integer stall_count = 0;
+	integer stalls_before = 0;
+	reg [7:0] counter_before_stall;
 	always @(posedge dut.clk_core)
-		if (dut.sample_dropped) drop_count = drop_count + 1;
+		if (dut.source_stalled) stall_count = stall_count + 1;
 
 	// Total samples produced, in a width that does not wrap.  The design's own
 	// data_counter is 8 bits, so measuring how far the master has fallen behind
@@ -279,7 +280,7 @@ module spi_counter_stream_tb;
 		// ------------------------------------------------------------
 		// Let the IP get configured, then let the FIFO build a backlog
 		// deep enough to serve a 16-byte burst but well short of the
-		// 64-entry depth, so nothing is dropped yet.
+		// 64-entry depth, so the source is not stalled yet.
 		// ------------------------------------------------------------
 		#(CFG_NS + 24 * SAMPLE_NS);
 
@@ -302,20 +303,14 @@ module spi_counter_stream_tb;
 		last_of_burst1 = burst[15];
 
 		// ------------------------------------------------------------
-		// Test 2: stop reading long enough for the FIFO to fill and start
-		// dropping.  FIFO_DEPTH samples fill it; the extra margin below
-		// guarantees the overflow actually happens at any DATA_RATE_HZ.
+		// Test 2: stop reading long enough for the FIFO to fill and stall the
+		// synthetic source. FIFO_DEPTH samples fill it; the extra margin below
+		// guarantees backpressure actually happens at any DATA_RATE_HZ.
 		//
-		// Note on what overflow looks like from the master's side: because
-		// the policy is drop-on-full, the FIFO keeps the OLDEST samples and
-		// discards new ones, so the master does NOT see a jump right after
-		// the stall — it sees a contiguous run of stale data and only hits
-		// the discontinuity once it has drained the backlog.  With a master
-		// slower than 500 kB/s it never drains, so the jump never surfaces.
-		// The drop mechanism is therefore checked directly rather than
-		// inferred from the byte stream.
+		// The source must stop advancing while full. Otherwise this test
+		// generator creates the same counter gaps it is intended to detect.
 		// ------------------------------------------------------------
-		drops_before = drop_count;
+		stalls_before = stall_count;
 		ticks_before = tick_count;
 		#(2 * dut.FIFO_DEPTH * SAMPLE_NS);   // no master activity
 
@@ -324,22 +319,29 @@ module spi_counter_stream_tb;
 			         dut.fifo_count, dut.FIFO_DEPTH);
 			errors = errors + 1;
 		end
-		if (drop_count <= drops_before) begin
-			$display("FAIL: no samples dropped during the stall window");
+		if (stall_count <= stalls_before) begin
+			$display("FAIL: source was not stalled while the FIFO was full");
 			errors = errors + 1;
 		end
 		if (led_r !== 1'b0) begin
-			$display("FAIL: red LED not lit — drop-on-full never signalled");
+			$display("FAIL: red LED not lit — FIFO backpressure never signalled");
 			errors = errors + 1;
 		end
-		$display("  stall window: %0d samples dropped, fifo_count = %0d",
-		         drop_count - drops_before, dut.fifo_count);
+		counter_before_stall = dut.data_counter;
+		#(8 * SAMPLE_NS);
+		if (dut.data_counter !== counter_before_stall) begin
+			$display("FAIL: counter advanced while FIFO was full (0x%02x -> 0x%02x)",
+			         counter_before_stall, dut.data_counter);
+			errors = errors + 1;
+		end
+		$display("  stall window: %0d blocked samples, fifo_count = %0d",
+		         stall_count - stalls_before, dut.fifo_count);
 
 		spi_burst(16);
 		dump_burst(16, "burst 2");
 
-		// Buffered data must survive the overflow intact and pick up exactly
-		// where burst 1 stopped — drop-on-full must never corrupt or reorder
+		// Buffered data must survive backpressure intact and pick up exactly
+		// where burst 1 stopped. A full FIFO must never corrupt or reorder
 		// what is already queued.
 		check_consecutive(16, "burst 2");
 		if (burst[0] !== last_of_burst1 + 8'd1) begin

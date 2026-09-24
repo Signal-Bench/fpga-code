@@ -1,0 +1,61 @@
+# SPI Stream Reliability Changes
+
+## Summary
+
+This branch makes the synthetic SPI stream generators preserve a consecutive
+test sequence when their transmit FIFO becomes full. It also expands the
+testbenches and documentation to describe FIFO backpressure accurately.
+
+These changes apply to:
+
+- `spi_counter_stream`: ascending byte counter
+- `spi_hw_stream`: repeating `Hello World!` message
+
+## Problem
+
+Both generators previously advanced their source on every sample tick, even
+when the FIFO was full. The full FIFO rejected the new byte, but the source
+continued advancing. Once the buffered data drained, the master observed a
+forward jump that looked exactly like an SPI byte-loss problem.
+
+This was especially confusing for the counter test, whose purpose is to make
+real missing, repeated, or reordered SPI bytes easy to detect.
+
+The iCE40 hard-SPI design also has limited timing margin near 10 MHz when its
+general-fabric pins are used. The companion ESP32 firmware now defaults to a
+2 MHz SPI clock for hardware validation.
+
+## Changes
+
+- Advance `data_counter` only when a counter byte is accepted into the FIFO.
+- Advance `msg_idx` only when a message byte is accepted into the FIFO.
+- Treat a full FIFO as backpressure that pauses the synthetic source.
+- Preserve the red LED indication while the source is stalled.
+- Update both READMEs to distinguish source backpressure from transport loss.
+- Add simulation assertions that the source does not advance while full.
+
+With this behavior, a counter jump or skipped message character is evidence
+of a transport or hard-SPI issue rather than an intentional generator drop.
+
+## Verification
+
+Both behavioral simulations pass with Icarus Verilog:
+
+```text
+PASS: all spi_counter_stream tests completed successfully
+PASS: all spi_hw_stream tests completed successfully
+```
+
+The simulations cover normal sequencing, FIFO-full backpressure, source
+stalling, buffered-data integrity, and continuity across chip-select toggles.
+
+## Remaining Limitation
+
+These are stream-only bring-up images. Their MOSI data is drained to prevent
+receive overrun but is not decoded, so they do not implement the SignalBench
+ready handshake or protocol-selection commands. A mode must not be considered
+selected unless a future command-capable FPGA image returns a valid ACK.
+
+The behavioral `SB_SPI` model is not silicon-accurate. Final validation still
+requires synthesizing the bitstream and checking the stream on the target
+board at 2 MHz.

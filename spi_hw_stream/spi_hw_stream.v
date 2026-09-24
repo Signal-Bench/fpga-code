@@ -7,8 +7,8 @@
  * soft SPI master out of fabric.
  *
  * Test payload: the ASCII string "Hello World!" (MSG_LEN = 12 bytes, one
- * character per byte, no terminator), emitted one character per tick at
- * DATA_RATE_HZ and wrapping from '!' back to 'H'.  Each character is pushed
+ * character per byte, no terminator), emitted at up to DATA_RATE_HZ and
+ * wrapping from '!' back to 'H'. Each character is pushed
  * into a FIFO; the SPI service state machine keeps the hard IP's transmit
  * register loaded from the FIFO head, so whatever byte the master clocks out
  * is the next character of the message.  A correctly working link shows the
@@ -34,14 +34,12 @@
  * Producer/consumer rates: the message source produces DATA_RATE_HZ bytes/s,
  * so the master must sustain at least 8 * DATA_RATE_HZ bits/s of SPI clock to
  * keep up (24 kbit/s at the current 3 kHz), plus margin for inter-transaction
- * gaps.  Below that the FIFO fills and new characters are DROPPED
- * (drop-on-full, never overwrite), which shows up on the master side as a
- * skip forward within the message (e.g. "Hello Wo" then "rld!" missing) rather
- * than corrupted or out-of-order data.  The red LED flags that this is
- * happening.
+ * gaps.  If the FIFO fills, the synthetic message source pauses until space
+ * becomes available.  This keeps the test stream consecutive so any observed
+ * skip is attributable to the SPI path rather than the generator itself.
  *
  * Debug LEDs (active low on the UPduino):
- *   RED:   pulses when a sample was dropped (FIFO full — master too slow)
+ *   RED:   on while the synthetic source is stalled by a full FIFO
  *   GREEN: on once the hard SPI IP has been configured
  *   BLUE:  pulses when a byte is handed to the IP (master is clocking)
  */
@@ -95,7 +93,7 @@ module top (
 	//
 	// A Verilog string literal packs its first character into the most
 	// significant byte, so character i lives at bits [8*(MSG_LEN-1-i) +: 8].
-	// msg_idx walks 0 .. MSG_LEN-1 and wraps, one step per tick.
+	// msg_idx walks 0 .. MSG_LEN-1 and wraps, one step per accepted source tick.
 	// ----------------------------------------------------------------
 	localparam integer          MSG_LEN = 12;
 	localparam [8*MSG_LEN-1:0]  MSG     = "Hello World!";
@@ -127,16 +125,14 @@ module top (
 	wire [7:0] fifo_head  = fifo_mem[fifo_rd];
 
 	wire fifo_push = tick & ~fifo_full;
-	wire sample_dropped = tick & fifo_full;
+	wire source_stalled = tick & fifo_full;
 	reg  fifo_pop;   // single-cycle pulse, driven by the SPI service FSM
 
 	always @(posedge clk_core) begin
-		if (tick)
-			msg_idx <= (msg_idx == MSG_LEN - 1) ? {MSG_IW{1'b0}} : msg_idx + 1'b1;
-
 		if (fifo_push) begin
 			fifo_mem[fifo_wr] <= msg_byte;
 			fifo_wr           <= fifo_wr + 1'b1;
+			msg_idx           <= (msg_idx == MSG_LEN - 1) ? {MSG_IW{1'b0}} : msg_idx + 1'b1;
 		end
 
 		if (fifo_pop)
@@ -330,7 +326,7 @@ module top (
 	reg [21:0] tx_led_ctr   = 0;
 
 	always @(posedge clk_core) begin
-		if (sample_dropped)
+		if (source_stalled)
 			drop_led_ctr <= LED_CYCLES[21:0];
 		else
 			drop_led_ctr <= drop_led_ctr - (drop_led_ctr != 0);

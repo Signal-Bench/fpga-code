@@ -18,8 +18,8 @@ much weaker as a check.
 
 ## What it does
 
-A free-running 8-bit counter increments at **`DATA_RATE_HZ` (currently 3 kHz)**
-and wraps `0xFF -> 0x00`.
+An 8-bit counter is produced at up to **`DATA_RATE_HZ` (currently 3 kHz)** and
+wraps `0xFF -> 0x00`. It pauses while FIFO backpressure is active.
 Each value is pushed into a 64-entry FIFO. A service state machine configures
 the hard IP, then keeps its transmit register loaded from the FIFO head, so
 every byte the master clocks out is the next value in the sequence.
@@ -65,22 +65,20 @@ These are the hard IP's pads routed out through general fabric rather than the
 UP5K's dedicated config-SPI pins (14/15/16/17), which keeps the onboard flash
 and the FTDI programmer off this bus. The cost is routing delay — see below.
 
-## Rates, and why you will probably see drops
+## Rates and backpressure
 
 The counter produces `DATA_RATE_HZ` bytes/s — **3 kB/s** at the current
 setting. The master only keeps up if it sustains **≥ 8 × `DATA_RATE_HZ`**
 bits/s of SPI clock (**24 kbit/s** at 3 kHz). Below that the FIFO fills and new
-samples are **dropped** (drop-on-full — queued data is never overwritten or
-reordered).
+samples pause. Queued data is never overwritten or reordered, and the
+synthetic counter does not advance until FIFO space is available.
 
-Because the oldest samples are the ones kept, a slow master doesn't see a jump
-right after a stall — it sees a contiguous run of *stale* data and only hits
-the discontinuity once it drains the backlog. So:
+Because this is a link-integrity generator rather than a real-time capture
+source, backpressure preserves a consecutive sequence. So:
 
 - **Bytes increment by exactly 1** → link is working.
-- **Red LED on** → samples are being dropped, i.e. the master is too slow.
-  Expected below 8 × `DATA_RATE_HZ` bits/s; not a link fault.
-- **Bytes jump forward** → you drained the backlog and caught up to real time.
+- **Red LED on** → the counter is paused because the master is too slow.
+- **Bytes jump forward** → the SPI path lost or skipped a byte.
 - **`0xFF` runs / repeats / decrements** → something is actually wrong.
 
 Change `DATA_RATE_HZ` in the source if you want a different rate. Everything
@@ -98,12 +96,12 @@ so editing `DATA_RATE_HZ` appeared to do nothing.) Verified in simulation from
 |---|---|
 | GREEN | hard SPI IP finished configuring (should light immediately at power-on) |
 | BLUE  | pulses when a byte is handed to the IP — master is clocking |
-| RED   | pulses when a sample was dropped — master too slow |
+| RED   | pulses while FIFO backpressure stalls the counter |
 
 ## Commands
 
 ```
-make sim     # testbench: verifies sequencing, drop-on-full, and CS-boundary continuity
+make sim     # testbench: verifies sequencing, backpressure, and CS-boundary continuity
 make wave    # same, with a GTKWave dump
 make build   # bitstream
 make time    # static timing (icetime cannot analyze the SPI/HFOSC hard cells — expected warnings)

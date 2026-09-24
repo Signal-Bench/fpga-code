@@ -60,22 +60,21 @@ These are the hard IP's pads routed out through general fabric rather than the
 UP5K's dedicated config-SPI pins (14/15/16/17), which keeps the onboard flash
 and the FTDI programmer off this bus. The cost is routing delay — see below.
 
-## Rates, and why you will probably see drops
+## Rates and backpressure
 
 The message source produces **3 kB/s**. The master only keeps up if it
 sustains **≥ 24 kbit/s** of SPI clock (plus margin for gaps between
-transactions). Below that the FIFO fills and new characters are **dropped**
-(drop-on-full — queued data is never overwritten or reordered).
+transactions). Below that the FIFO fills and pauses the synthetic message
+source. Queued data is never overwritten or reordered, and the message index
+does not advance until FIFO space is available.
 
-Because the oldest characters are the ones kept, a slow master doesn't see a
-skip right after a stall — it sees a contiguous run of *stale* data and only
-hits the discontinuity once it drains the backlog. So:
+Because this is a link-integrity generator rather than a real-time source,
+backpressure preserves a consecutive message. So:
 
 - **The string repeats cleanly** (`...World!Hello...`) → link is working.
-- **Red LED on** → characters are being dropped, i.e. the master is too slow.
-  Expected below 24 kbit/s; not a link fault.
-- **The string skips forward mid-word** (`Hello Wold!`) → you drained the
-  backlog and caught up to real time.
+- **Red LED on** → the message source is paused because the master is too slow.
+- **The string skips forward mid-word** (`Hello Wold!`) → the SPI path lost
+  or skipped a byte.
 - **`0xFF` runs / repeated or garbled characters** → something is actually wrong.
 
 `DATA_RATE_HZ` in the source sets the rate; the 3 kHz here was chosen so a
@@ -87,12 +86,12 @@ slow master can track it without drops.
 |---|---|
 | GREEN | hard SPI IP finished configuring (should light immediately at power-on) |
 | BLUE  | pulses when a byte is handed to the IP — master is clocking |
-| RED   | pulses when a sample was dropped — master too slow |
+| RED   | pulses while FIFO backpressure stalls the message source |
 
 ## Commands
 
 ```
-make sim     # testbench: verifies sequencing, drop-on-full, and CS-boundary continuity
+make sim     # testbench: verifies sequencing, backpressure, and CS-boundary continuity
 make wave    # same, with a GTKWave dump
 make build   # bitstream
 make time    # static timing (icetime cannot analyze the SPI/HFOSC hard cells — expected warnings)
