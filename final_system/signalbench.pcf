@@ -1,0 +1,43 @@
+# SignalBench unified top -- UPduino v3 pinout
+#
+# CLOCK: the 12 MHz board oscillator on pin 20, which only reaches the FPGA
+# if jumper R16 ("OSC" on the silkscreen) is shorted.  Without it there is
+# no clock and nothing runs.  SB_HFOSC is not usable -- CAN needs crystal
+# accuracy, see ../can_sniffer/clock_choice.md.
+#
+# PIN 35 IS DELIBERATELY UNASSIGNED.  Instantiating SB_PLL40_CORE consumes
+# that I/O site (FPGA-TN-02052 section 5.1.1: the GPLL pin can only drive
+# the PLL reference once a PLL exists).  Assigning anything to pin 35 makes
+# nextpnr fail with "PLL couldn't be placed anywhere".
+#
+# GBIN pins on SG48 are 20, 35, 37, 44 and 23.  With the PLL instantiated,
+# 35 is gone, so: 20 = crystal, 37 = probed SCK, 44 and 23 stay free as
+# spares.  Do not spend them on ordinary outputs.
+
+set_io -nowarn clk_12       20   # GBIN, 12 MHz crystal (R16)
+set_io -nowarn p_sck        37   # GBIN, probed SPI clock
+
+# Probed buses
+set_io -nowarn can_rx       38   # transceiver RXD
+set_io -nowarn scl_pin      42
+set_io -nowarn sda_pin      36
+set_io -nowarn uart_tx_pin  43   # target's TX
+set_io -nowarn uart_rx_pin  34   # target's RX
+set_io -nowarn p_mosi       31
+set_io -nowarn p_miso       32
+set_io -nowarn p_cs         28
+
+# MCU link -- FPGA is the SPI slave, so the MCU drives SCK/CS/MOSI.
+# Same pins the earlier SPI designs use, so an existing analyzer setup
+# carries over.
+set_io -nowarn mcu_sck      11
+set_io -nowarn mcu_mosi     21
+set_io -nowarn mcu_cs       19
+set_io -nowarn mcu_miso     13
+set_io -nowarn mcu_irq      12
+
+set_io -nowarn spi_cs_flash 16
+
+set_io -nowarn led_r        41
+set_io -nowarn led_g        39
+set_io -nowarn led_b        40

@@ -25,6 +25,10 @@ module can_bit_timing_tb;
 	parameter integer PHASE_SEG2 = 3;
 	parameter integer SJW        = 3;
 	parameter real    CLK_MHZ    = 12.0;
+	// Baud rate prescaler: tq = (BRP + 1) core clocks.  Must be >= 1 when
+	// the DUT is built with PIPELINE_RESYNC=1 -- see can_bit_timing.v.
+	parameter integer BRP             = 0;
+	parameter integer PIPELINE_RESYNC = 0;
 
 	localparam integer NBITS       = 120;
 	localparam real    CLK_NS      = 1000.0 / CLK_MHZ;
@@ -32,7 +36,7 @@ module can_bit_timing_tb;
 
 	reg        clk = 1'b0;
 	reg        rst = 1'b1;
-	reg  [7:0] brp = 8'd0;                        // tq = 1 core clock
+	reg  [7:0] brp = BRP[7:0];                    // tq = (BRP+1) core clocks
 	reg        rx_raw   = 1'b1;                   // idle recessive
 	reg        bus_idle = 1'b1;
 
@@ -40,7 +44,8 @@ module can_bit_timing_tb;
 
 	can_bit_timing #(
 		.PROP_SEG(PROP_SEG), .PHASE_SEG1(PHASE_SEG1),
-		.PHASE_SEG2(PHASE_SEG2), .SJW(SJW)
+		.PHASE_SEG2(PHASE_SEG2), .SJW(SJW),
+		.PIPELINE_RESYNC(PIPELINE_RESYNC)
 	) uut (
 		.clk(clk), .rst(rst), .brp(brp),
 		.rx_raw(rx_raw), .bus_idle(bus_idle),

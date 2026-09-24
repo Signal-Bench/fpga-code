@@ -39,7 +39,20 @@ module can_bit_timing #(
 	parameter integer PROP_SEG   = 4,
 	parameter integer PHASE_SEG1 = 4,
 	parameter integer PHASE_SEG2 = 3,
-	parameter integer SJW        = 3
+	parameter integer SJW        = 3,
+
+	// Lift the resync adder chain out of the tq_en critical path by
+	// precomputing its candidates into registers.  Raises placed fmax from
+	// ~24 MHz to ~32 MHz, which is what makes a 24 MHz unified core clock
+	// close -- see ../unified_top.md.
+	//
+	// REQUIRES brp >= 1.  The precomputed values are one core clock behind
+	// tq_pos/tseg1_eff/tseg2_eff, so they are only settled in time when a
+	// time quantum is 2 or more core clocks.  At brp = 0 they are stale and
+	// the module is WRONG, which is why this defaults off: can_sniffer.v
+	// runs brp = 0 at 12 MHz and must stay bit-exact with the configuration
+	// verified on hardware.
+	parameter integer PIPELINE_RESYNC = 0
 )(
 	input  wire       clk,
 	input  wire       rst,
@@ -67,6 +80,16 @@ module can_bit_timing #(
 		end
 		if (PHASE_SEG2 < IPT) begin
 			$display("can_bit_timing: PHASE_SEG2=%0d below information processing time %0d", PHASE_SEG2, IPT);
+			$finish;
+		end
+	end
+
+	// PIPELINE_RESYNC precondition.  Checked on brp itself rather than as a
+	// parameter assertion, because brp is a runtime input -- a baud-rate
+	// change to brp = 0 would silently break the precomputed path.
+	always @(posedge clk) begin
+		if (!rst && PIPELINE_RESYNC != 0 && brp == 8'd0) begin
+			$display("can_bit_timing: PIPELINE_RESYNC=1 requires brp >= 1 (tq >= 2 core clocks); brp=0 gives stale resync values");
 			$finish;
 		end
 	end
@@ -131,11 +154,64 @@ module can_bit_timing #(
 	wire [7:0] tseg2_new = (q_in2 > floor2) ? q_in2 : floor2;
 
 	// Effective lengths for this tq boundary's segment decisions.
-	wire [7:0] tseg1_use = (do_resync & in_tseg1) ? tseg1_new : tseg1_eff;
-	wire [7:0] tseg2_use = (do_resync & in_tseg2) ? tseg2_new : tseg2_eff;
+	//
+	// Two implementations, selected by PIPELINE_RESYNC and identical in
+	// behaviour whenever the parameter's brp precondition holds.
 
-	wire at_sample = (tq_pos == tseg1_use);
-	wire at_bitend = (tq_pos == (tseg1_use + tseg2_use));
+	wire [7:0] tseg1_use, tseg2_use;
+	wire       at_sample, at_bitend;
+
+	generate
+	if (PIPELINE_RESYNC == 0) begin : g_comb
+		// Original: compare -> add -> mux -> add -> compare, all in one
+		// core clock.  Valid at any brp, including 0.
+		assign tseg1_use = (do_resync & in_tseg1) ? tseg1_new : tseg1_eff;
+		assign tseg2_use = (do_resync & in_tseg2) ? tseg2_new : tseg2_eff;
+		assign at_sample = (tq_pos == tseg1_use);
+		assign at_bitend = (tq_pos == (tseg1_use + tseg2_use));
+
+	end else begin : g_pipe
+		// Precomputed.  Every input is a register that only changes at a tq
+		// boundary, so with brp >= 1 these are settled before the next
+		// boundary consumes them.  Only a mux and a compare remain.
+		reg [7:0] tseg1_new_r  = TSEG1_NOM[7:0];
+		reg [7:0] tseg2_new_r  = TSEG2_NOM[7:0];
+		reg [7:0] bitend_nom_r = TSEG1_NOM[7:0] + TSEG2_NOM[7:0];
+		reg [7:0] bitend_rs1_r = TSEG1_NOM[7:0] + TSEG2_NOM[7:0];
+		reg [7:0] bitend_rs2_r = TSEG1_NOM[7:0] + TSEG2_NOM[7:0];
+		reg       in_tseg1_r   = 1'b0;
+		reg       in_tseg2_r   = 1'b0;
+
+		always @(posedge clk) begin
+			if (rst) begin
+				tseg1_new_r  <= TSEG1_NOM[7:0];
+				tseg2_new_r  <= TSEG2_NOM[7:0];
+				bitend_nom_r <= TSEG1_NOM[7:0] + TSEG2_NOM[7:0];
+				bitend_rs1_r <= TSEG1_NOM[7:0] + TSEG2_NOM[7:0];
+				bitend_rs2_r <= TSEG1_NOM[7:0] + TSEG2_NOM[7:0];
+				in_tseg1_r   <= 1'b0;
+				in_tseg2_r   <= 1'b0;
+			end else begin
+				tseg1_new_r  <= tseg1_new;
+				tseg2_new_r  <= tseg2_new;
+				bitend_nom_r <= tseg1_eff + tseg2_eff;
+				bitend_rs1_r <= tseg1_new + tseg2_eff;
+				bitend_rs2_r <= tseg1_eff + tseg2_new;
+				in_tseg1_r   <= in_tseg1;
+				in_tseg2_r   <= in_tseg2;
+			end
+		end
+
+		wire rs1 = do_resync & in_tseg1_r;
+		wire rs2 = do_resync & in_tseg2_r;
+
+		assign tseg1_use = rs1 ? tseg1_new_r : tseg1_eff;
+		assign tseg2_use = rs2 ? tseg2_new_r : tseg2_eff;
+		assign at_sample = (tq_pos == tseg1_use);
+		assign at_bitend = (tq_pos == (rs1 ? bitend_rs1_r :
+		                               rs2 ? bitend_rs2_r : bitend_nom_r));
+	end
+	endgenerate
 
 	// ----------------------------------------------------------------
 	// Main sequential process
