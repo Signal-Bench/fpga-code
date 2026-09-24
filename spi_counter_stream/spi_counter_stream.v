@@ -319,10 +319,13 @@ module top (
 				spi_stb <= 1'b1; spi_rw <= 1'b0;
 				if (spi_ack) begin
 					spi_stb <= 1'b0;
-					if (spi_dato[SR_TRDY] && (response_pending || !fifo_empty))
-						state <= S_LOAD_TX;
-					else if (spi_dato[SR_RRDY])
+					// Drain incoming command bytes first. Prioritizing TRDY here
+					// can leave SPIRXDR occupied until the following byte arrives,
+					// setting ROE and losing MOSI bytes on real silicon.
+					if (spi_dato[SR_RRDY])
 						state <= S_DRAIN_RX;
+					else if (spi_dato[SR_TRDY] && (response_pending || !fifo_empty))
+						state <= S_LOAD_TX;
 					else
 						state <= S_POLL;
 				end
@@ -356,14 +359,17 @@ module top (
 								command_pos <= 2'd1;
 						end
 						2'd1: begin
-							command_pos <= (spi_dato == PROTO_MAGIC_1) ? 2'd2 : 2'd0;
+							if (spi_dato == PROTO_MAGIC_1)
+								command_pos <= 2'd2;
+							else
+								command_pos <= (spi_dato == PROTO_MAGIC_0) ? 2'd1 : 2'd0;
 						end
 						2'd2: begin
 							if (spi_dato == PROTO_READY_0 || spi_dato == PROTO_MODE_CMD) begin
 								command_opcode <= spi_dato;
 								command_pos <= 2'd3;
 							end else begin
-								command_pos <= 2'd0;
+								command_pos <= (spi_dato == PROTO_MAGIC_0) ? 2'd1 : 2'd0;
 							end
 						end
 						2'd3: begin

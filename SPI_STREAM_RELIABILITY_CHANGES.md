@@ -22,12 +22,12 @@ This was especially confusing for the counter test, whose purpose is to make
 real missing, repeated, or reordered SPI bytes easy to detect.
 
 The iCE40 hard-SPI design also has limited timing margin near 10 MHz when its
-general-fabric pins are used. The companion ESP32 firmware now defaults to a
-2 MHz SPI clock and explicitly selects the standard mode-0 rising-edge sample
-point. ESP32-H2's zero-initialized sample-point mode delays sampling by half a
-cycle, which otherwise coincides with the iCE40's falling-edge MISO updates.
-Its 64-byte polling interval is also reduced from 20 ms to 10 ms, increasing
-nominal read capacity from 3.2 kB/s to 6.4 kB/s for the 3 kB/s test source.
+general-fabric pins are used. The companion ESP32 firmware defaults to a 2 MHz
+SPI clock. Hardware captures showed that explicitly selecting the phase-1
+sample point increased one-to-zero MISO errors, so the firmware now retains
+the ESP32-H2 default sample point and restores a one-clock CS setup interval.
+Its 64-byte polling interval is reduced from 20 ms to 10 ms, increasing nominal
+read capacity from 3.2 kB/s to 6.4 kB/s for the 3 kB/s test source.
 
 ## Changes
 
@@ -37,7 +37,9 @@ nominal read capacity from 3.2 kB/s to 6.4 kB/s for the 3 kB/s test source.
 - Preserve the red LED indication while the source is stalled.
 - Update both READMEs to distinguish source backpressure from transport loss.
 - Add simulation assertions that the source does not advance while full.
-- Document the ESP32-H2 sample-edge requirement found during hardware testing.
+- Restore the ESP32-H2 default sample point after phase-1 regressed hardware captures.
+- Drain hard-SPI RX before TX refills to prevent command receive overruns.
+- Add command turnaround time and bounded mode-command retries on the MCU.
 - Add ready/mode command decoding and follow-up transaction ACKs.
 - Map SPI mode to ascending printable ASCII and DIO mode to `Hello World!`.
 
