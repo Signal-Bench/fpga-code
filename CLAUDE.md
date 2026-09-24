@@ -104,7 +104,9 @@ host_to_spi/        UART-to-host bridge that drives a real SPI *master* transact
 host_to_fpga/        UART echo + inverted-byte-response demo, used to validate the link
 clock_out/           UART RX -> bit-banged SPI TX bridge (earlier/simpler than uart_to_spi)
 clock_test/          minimal design: divides 48 MHz HFOSC down to ~1 MHz on a pin
-spi_hw_stream/       hard-IP (SB_SPI) SLAVE bring-up test — streams a 500 kHz counter
+spi_hw_stream/       hard-IP (SB_SPI) SLAVE bring-up test — streams a repeating "Hello World!"
+spi_counter_stream/  same design with the ascending-byte-counter payload (stronger link check)
+spi_to_uart/         hard-IP (SB_SPI) SLAVE that prints every MOSI byte to picocom as hex
 spi_slave/           standalone SPI slave register interface, not wired into any top module
 tools/               send_pattern.c — host-side UART test-pattern generator
 ice40_ultraplus_examples/   vendored example collection (own Makefiles/README)
@@ -293,7 +295,20 @@ icepack <name>.asc <name>.bin
 - `uart_to_spi/` — sniffs two UART lines (TX and RX of a target) and sends `[0x48 header][flag][data]` over SPI. Structural ancestor of `i2c_sniffer.v` (oscillator, SPI state machine, LED pulse-stretcher pattern all reused directly).
 - `host_to_fpga/` — UART echo + inverted-byte-response demo (`"N <data>\n"` protocol), used to validate the UART link itself.
 - `host_to_spi/` — UART-to-host bridge that bit-bangs a real SPI *master* transaction (vs. the sniffers, which only ever drive MOSI) and reports MISO data back over UART.
-- `spi_hw_stream/` — bring-up test for the UP5K's **hardened** SPI block (`SB_SPI`) as a **slave**, the only design here where the FPGA is not the SPI master. Streams a 500 kHz incrementing byte counter through a 64-entry FIFO so a master can verify the link. Has its own `README.md` (wiring, LED meanings, rate math, and the hardware questions it's meant to answer) and a `sim` target whose testbench stubs `SB_SPI` behaviorally — that model is *not* silicon-accurate, so don't treat its passing as proof the real IP behaves the same way.
+- `spi_hw_stream/` — bring-up test for the UP5K's **hardened** SPI block (`SB_SPI`) as a **slave**, the only design here where the FPGA is not the SPI master. Streams a repeating `"Hello World!"` string through a 64-entry FIFO so a master can verify the link (the counter payload it originally streamed now lives in `spi_counter_stream/`). Has its own `README.md` (wiring, LED meanings, rate math, and the hardware questions it's meant to answer) and a `sim` target whose testbench stubs `SB_SPI` behaviorally — that model is *not* silicon-accurate, so don't treat its passing as proof the real IP behaves the same way.
+- `spi_counter_stream/` — the same `SB_SPI` slave bring-up design as `spi_hw_stream/`,
+  keeping the **ascending-byte-counter** payload: a missed, repeated, or reordered byte
+  is visible immediately, which the string payload cannot show. Payload rate is
+  `DATA_RATE_HZ` (currently 3 kHz) and it genuinely takes effect — the tick-divider
+  width is derived from `TICK_DIV` via `$clog2` and the testbench scales its wait
+  windows off `dut.TICK_DIV`, so the sim is meaningful at any rate (checked 500 Hz to
+  2 MHz). An earlier revision hardcoded that counter at 6 bits, which pinned the usable
+  rate at >= 375 kHz and made edits to `DATA_RATE_HZ` appear to do nothing.
+- `spi_to_uart/` — `spi_hw_stream`'s `SB_SPI` slave with the counter stream replaced by
+  the UART TX path from `host_to_fpga`: every byte received on MOSI is printed to the
+  host as hex over pin 14 at 1 Mbaud (`make pico`), one line per CS assertion. Same SPI
+  pins as `spi_hw_stream`, receive-only (MISO carries nothing). Simulation-verified
+  only; has its own `README.md` with wiring, output format, and throughput limits.
 - `spi_slave/` — a fuller-featured **soft** SPI slave register interface (separate read/write queues); not currently wired into any `top` module in this repo, and has no Makefile of its own.
 - `common/uart.v` / `common/util.v` — shared building blocks (`uart_tx`/`uart_rx`, `divide_by_n`, `fifo`, `pulse_stretcher`, etc.), pulled in via `` `include "../common/..." `` by nearly every design above.
 
