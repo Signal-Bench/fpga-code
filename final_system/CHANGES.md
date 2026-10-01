@@ -184,8 +184,9 @@ use the correct 3-flop pattern.
 
 ## Bugs found by the testbench
 
-Three real defects, all in code written this session, all found by `make sim` rather
-than by inspection. Recorded because each is a trap that would recur.
+Two real defects, both in code written this session, both found by `make sim` rather
+than by inspection. A third change is listed below them because it was originally
+recorded here as a bug, and that turned out to be wrong.
 
 1. **The triggering event was dropped.** `recording` is set by a non-blocking
    assignment, so it was still 0 during the cycle the trigger matched, and the matching
@@ -197,12 +198,16 @@ than by inspection. Recorded because each is a trap that would recur.
    the byte *after* the one configured. Separately, `trig0` was matching the newest byte
    where `state_management.md` specifies it as the first byte on the wire. Both fixed.
 
-3. **The drain pointer ran away.** The service FSM reloads `SPITXDR` whenever `TRDY` is
-   set — which is what meets the refill deadline, and happens continuously whether or
-   not a transaction is in progress. Advancing the read pointer on the TX load therefore
-   walked it through the whole buffer while the bus sat idle, so the first record was
-   gone before the MCU asked for it. Fixed by advancing per byte *received* and framing
-   on CS.
+3. **CORRECTION: "the drain pointer ran away" was a misdiagnosis.** An earlier version
+   of this file listed it as a third bug. In fact the advance-per-received-byte policy and
+   CS framing in `sb_mcu_link.v` were written *before* the testbench had been
+   instrumented. The instrumented run then showed the real cause of that failure was
+   bug 1, the dropped triggering event. Re-checked by restoring the original
+   advance-on-TX-load policy with bugs 1 and 2 still fixed: `make sim` passes. So the
+   change is kept as a robustness measure (CS framing means an aborted transaction can't
+   desynchronize command parsing), but it is **not** a demonstrated bug fix, and nothing
+   in simulation distinguishes the two policies. Real silicon might — the `SB_SPI` model
+   does not show what `TRDY` does while CS is high.
 
 ---
 
