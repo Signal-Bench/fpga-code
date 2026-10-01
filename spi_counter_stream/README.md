@@ -18,9 +18,10 @@ ASCII and `"Hello World!"`. The MCU selects between them with a mode command.
 
 The default payload is printable ASCII from space (`0x20`) through `~` (`0x7E`),
 followed by LF and repeated. The alternate payload is `"Hello World!\n"`.
-Bytes are produced at up to **`DATA_RATE_HZ` (currently 3 kHz)** and pause while
-FIFO backpressure is active. A service state machine keeps the hard IP's
-transmit register loaded from the FIFO or a pending command response.
+Bytes are produced at **`DATA_RATE_HZ` (currently 3 kHz)** and are dropped if
+the FIFO is full, the way a live bus loses unread traffic. A service state
+machine keeps the hard IP's transmit register loaded from the FIFO or a pending
+command response.
 
 The command transaction and response transaction are separate:
 
@@ -74,22 +75,29 @@ These are the hard IP's pads routed out through general fabric rather than the
 UP5K's dedicated config-SPI pins (14/15/16/17), which keeps the onboard flash
 and the FTDI programmer off this bus. The cost is routing delay — see below.
 
-## Rates and backpressure
+## Rates and dropping
 
 The selected pattern produces `DATA_RATE_HZ` bytes/s — **3 kB/s** at the current
 setting. The master only keeps up if it sustains **≥ 8 × `DATA_RATE_HZ`**
 bits/s of SPI clock (**24 kbit/s** at 3 kHz). Below that the FIFO fills and new
-samples pause. Queued data is never overwritten or reordered, and the
-synthetic source does not advance until FIFO space is available.
+samples are **dropped** (drop-on-full, never overwrite): the pattern keeps
+advancing whether or not the FIFO accepts the byte.
 
-Because this is a link-integrity generator rather than a real-time capture
-source, backpressure preserves a consecutive sequence. So:
+**That is deliberate.** This image models a **live bus**, which cannot be told
+to wait — so an unread sample is lost, exactly as real traffic would be, and
+the size of the skip tells you how far behind the master actually is. Queued
+data is never overwritten or reordered; only the *new* sample is lost. So:
 
-- **ASCII advances from space through `~`, then LF** → link is working.
+- **ASCII advances from space through `~`, then LF** → the master is keeping up.
 - **`Hello World!` lines repeat** → alternate mode is working.
-- **Red LED on** → the source is paused because the master is too slow.
-- **Bytes jump forward** → the SPI path lost or skipped a byte.
+- **Red LED on** → samples are being dropped; the master is too slow.
+- **Bytes jump forward** with the red LED dark → the SPI path lost a byte.
 - **`0xFF` runs / repeats / decrements** → something is actually wrong.
+
+Note the consequence: a skip alone does not distinguish "master too slow" from
+"link lost a byte" — the red LED is what separates them. If you need a source
+that can never drop, use [`../spi_replay_stream/`](../spi_replay_stream/),
+which replays a preloaded buffer at whatever rate the master sets.
 
 Change `DATA_RATE_HZ` in the source if you want a different rate. Everything
 downstream is derived from it — the tick divider width comes from `TICK_DIV`
@@ -107,12 +115,12 @@ also verifies ready/mode ACKs and both selectable payloads.
 |---|---|
 | GREEN | hard SPI IP finished configuring (should light immediately at power-on) |
 | BLUE  | pulses when a byte is handed to the IP — master is clocking |
-| RED   | pulses while FIFO backpressure stalls the source |
+| RED   | pulses when a sample was dropped (FIFO full — master too slow) |
 
 ## Commands
 
 ```
-make sim     # verifies sequencing, backpressure, commands, ACKs, and both modes
+make sim     # verifies sequencing, drop-on-full, commands, ACKs, and both modes
 make wave    # same, with a GTKWave dump
 make build   # bitstream
 make time    # static timing (icetime cannot analyze the SPI/HFOSC hard cells — expected warnings)

@@ -29,9 +29,11 @@
  * Producer/consumer rates: the source produces DATA_RATE_HZ bytes/s, so the
  * master must sustain at least 8 * DATA_RATE_HZ bits/s of SPI clock to keep
  * up (24 kbit/s at the current 3 kHz), plus margin for inter-transaction
- * gaps.  If the FIFO fills, the synthetic source pauses until space becomes
- * available.  This keeps the test stream consecutive so any observed jump is
- * attributable to the SPI path rather than the pattern generator itself.
+ * gaps.  If the FIFO fills, new bytes are DROPPED (drop-on-full, never
+ * overwrite), so a slow master sees a forward skip in the pattern.  That is
+ * intentional: this image models a LIVE bus, which cannot be told to wait, so
+ * the skip measures how fast the master actually sustains.  For the
+ * recorded-data case, where every byte must survive, see spi_replay_stream/.
  *
  * Debug LEDs (active low on the UPduino):
  *   RED:   on while the synthetic source is stalled by a full FIFO
@@ -117,7 +119,7 @@ module top (
 
 	reg  mode_switch = 1'b0;
 	wire fifo_push = tick & ~fifo_full & ~mode_switch;
-	wire source_stalled = tick & fifo_full;
+	wire sample_dropped = tick & fifo_full;
 	reg  fifo_pop;   // single-cycle pulse, driven by the SPI service FSM
 
 	always @(posedge clk_core) begin
@@ -128,9 +130,12 @@ module top (
 			ascii_char <= 8'h20;
 			msg_idx    <= 0;
 		end else begin
-			if (fifo_push) begin
-				fifo_mem[fifo_wr] <= source_byte;
-				fifo_wr           <= fifo_wr + 1'b1;
+			// Drop-on-full: the pattern advances every tick whether or not
+			// the FIFO accepts the byte, so a slow master sees a forward
+			// skip.  This is deliberate — it models a live bus, which
+			// cannot be stalled.  See spi_replay_stream/ for the
+			// recorded-data case, where no byte is ever lost.
+			if (tick) begin
 				if (mode_hello)
 					msg_idx <= (msg_idx == MSG_LEN - 1) ? {MSG_IW{1'b0}} : msg_idx + 1'b1;
 				else if (ascii_char == 8'h7E)
@@ -139,6 +144,11 @@ module top (
 					ascii_char <= 8'h20;
 				else
 					ascii_char <= ascii_char + 1'b1;
+			end
+
+			if (fifo_push) begin
+				fifo_mem[fifo_wr] <= source_byte;
+				fifo_wr           <= fifo_wr + 1'b1;
 			end
 
 			if (fifo_pop)
@@ -402,7 +412,7 @@ module top (
 	reg [21:0] tx_led_ctr   = 0;
 
 	always @(posedge clk_core) begin
-		if (source_stalled)
+		if (sample_dropped)
 			drop_led_ctr <= LED_CYCLES[21:0];
 		else
 			drop_led_ctr <= drop_led_ctr - (drop_led_ctr != 0);

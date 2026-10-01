@@ -60,25 +60,32 @@ These are the hard IP's pads routed out through general fabric rather than the
 UP5K's dedicated config-SPI pins (14/15/16/17), which keeps the onboard flash
 and the FTDI programmer off this bus. The cost is routing delay — see below.
 
-## Rates and backpressure
+## Rates and dropping
 
 The message source produces **3 kB/s**. The master only keeps up if it
 sustains **≥ 24 kbit/s** of SPI clock (plus margin for gaps between
-transactions). Below that the FIFO fills and pauses the synthetic message
-source. Queued data is never overwritten or reordered, and the message index
-does not advance until FIFO space is available.
+transactions). Below that the FIFO fills and new characters are **dropped**
+(drop-on-full, never overwrite): the message index keeps advancing whether or
+not the FIFO accepts the character.
 
-Because this is a link-integrity generator rather than a real-time source,
-backpressure preserves a consecutive message. So:
+**That is deliberate.** This image models a **live bus**, which cannot be told
+to wait — so an unread character is lost, exactly as real traffic would be, and
+the size of the skip tells you how far behind the master actually is. Queued
+data is never overwritten or reordered; only the *new* character is lost. So:
 
-- **The string repeats cleanly** (`...World!Hello...`) → link is working.
-- **Red LED on** → the message source is paused because the master is too slow.
-- **The string skips forward mid-word** (`Hello Wold!`) → the SPI path lost
-  or skipped a byte.
+- **The string repeats cleanly** (`...World!Hello...`) → the master is keeping up.
+- **Red LED on** → characters are being dropped; the master is too slow.
+- **The string skips forward mid-word** (`Hello Wold!`) with the red LED dark
+  → the SPI path itself lost a byte.
 - **`0xFF` runs / repeated or garbled characters** → something is actually wrong.
 
+Note the consequence: a skip alone does not distinguish "master too slow" from
+"link lost a byte" — the red LED is what separates them. If you need a source
+that can never drop, use [`../spi_replay_stream/`](../spi_replay_stream/),
+which replays a preloaded buffer at whatever rate the master sets.
+
 `DATA_RATE_HZ` in the source sets the rate; the 3 kHz here was chosen so a
-slow master can track it without drops.
+slow master can track it without drops. Raise it to find the master's ceiling.
 
 ## LEDs (active low)
 
@@ -86,12 +93,12 @@ slow master can track it without drops.
 |---|---|
 | GREEN | hard SPI IP finished configuring (should light immediately at power-on) |
 | BLUE  | pulses when a byte is handed to the IP — master is clocking |
-| RED   | pulses while FIFO backpressure stalls the message source |
+| RED   | pulses when a character was dropped (FIFO full — master too slow) |
 
 ## Commands
 
 ```
-make sim     # testbench: verifies sequencing, backpressure, and CS-boundary continuity
+make sim     # testbench: verifies sequencing, drop-on-full, and CS-boundary continuity
 make wave    # same, with a GTKWave dump
 make build   # bitstream
 make time    # static timing (icetime cannot analyze the SPI/HFOSC hard cells — expected warnings)
