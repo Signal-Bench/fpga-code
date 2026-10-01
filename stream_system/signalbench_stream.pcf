@@ -1,0 +1,36 @@
+# SignalBench STREAM -- UPduino v3 pinout
+#
+# CLOCK: 12 MHz board oscillator on pin 20.  Needs jumper R16 ("OSC")
+# shorted, exactly as can_sniffer does.  No clock = nothing runs.
+#
+# PIN 35 IS DELIBERATELY UNASSIGNED: SB_PLL40_CORE consumes that I/O site
+# and place-and-route fails if anything else is put on it.
+#
+# PROBE CHANNELS ARE SHARED between protocols (only one decoder runs at a
+# time), chosen so every existing rig plugs in unchanged:
+#   ch0 = pin 38   I2C SCL | UART target-TX | CAN RX (via VP230) | DIO
+#   ch1 = pin 42   I2C SDA | UART target-RX
+# i2c_sniffer.pcf, uart_to_spi.v and can_sniffer.pcf all used these.
+#
+# MCU link is the same four pins as spi_counter_stream / spi_hw_stream, so
+# existing ESP32 wiring carries over.
+
+set_io -nowarn clk_12       20   # GBIN, 12 MHz crystal (R16)
+
+set_io -nowarn ch0          38
+set_io -nowarn ch1          42
+
+set_io -nowarn p_sck        37   # GBIN, probed SPI clock
+set_io -nowarn p_mosi       31
+set_io -nowarn p_miso       32
+set_io -nowarn p_cs         28
+
+set_io -nowarn mcu_sck      11
+set_io -nowarn mcu_cs       19
+set_io -nowarn mcu_mosi     21
+set_io -nowarn mcu_miso     13
+
+set_io -nowarn spi_cs_flash 16
+set_io -nowarn led_r        41
+set_io -nowarn led_g        39
+set_io -nowarn led_b        40
