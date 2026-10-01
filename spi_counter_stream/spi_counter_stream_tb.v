@@ -304,18 +304,18 @@ module spi_counter_stream_tb;
 	task check_hello_present(input integer n);
 		integer i, j;
 		integer found;
-		integer matches;
+		integer match_ok;
 		reg [7:0] expected;
 		begin
 			found = 0;
 			for (i = 0; i <= n - 13; i = i + 1) begin
-				matches = 1;
+				match_ok = 1;
 				for (j = 0; j < 13; j = j + 1) begin
 					expected = HELLO_LINE[8*(12-j) +: 8];
 					if (burst[i+j] !== expected)
-						matches = 0;
+						match_ok = 0;
 				end
-				if (matches)
+				if (match_ok)
 					found = 1;
 			end
 			if (!found) begin
@@ -356,16 +356,16 @@ module spi_counter_stream_tb;
 	reg [7:0] last_of_burst1;
 	integer   lag_samples;
 
-	// Count source stalls straight off the design's internal strobe.
-	integer stall_count = 0;
-	integer stalls_before = 0;
-	reg [7:0] counter_before_stall;
+	// Count dropped samples straight off the design's internal strobe.
+	integer drop_count = 0;
+	integer drops_before = 0;
+	reg [7:0] counter_before_drops;
 	always @(posedge dut.clk_core)
-		if (dut.source_stalled) stall_count = stall_count + 1;
+		if (dut.sample_dropped) drop_count = drop_count + 1;
 
 	// Total samples produced, in a width that does not wrap.  The design's own
 	// ascii_char is 8 bits, so measuring how far the master has fallen behind
-	// with it aliases as soon as the stall exceeds 256 samples — which is what
+	// with it aliases as soon as the drop window exceeds 256 samples — which is what
 	// happens at high DATA_RATE_HZ.  Count ticks here instead.
 	integer tick_count = 0;
 	integer ticks_before = 0;
@@ -387,7 +387,7 @@ module spi_counter_stream_tb;
 		// ------------------------------------------------------------
 		// Let the IP get configured, then let the FIFO build a backlog
 		// deep enough to serve a 16-byte burst but well short of the
-		// 64-entry depth, so the source is not stalled yet.
+		// 64-entry depth, so nothing is dropped yet.
 		// ------------------------------------------------------------
 		#(CFG_NS + 24 * SAMPLE_NS);
 
@@ -410,14 +410,15 @@ module spi_counter_stream_tb;
 		last_of_burst1 = burst[15];
 
 		// ------------------------------------------------------------
-		// Test 2: stop reading long enough for the FIFO to fill and stall the
-		// synthetic source. FIFO_DEPTH samples fill it; the extra margin below
-		// guarantees backpressure actually happens at any DATA_RATE_HZ.
+		// Test 2: stop reading long enough for the FIFO to fill and start
+		// dropping samples. FIFO_DEPTH samples fill it; the extra margin below
+		// guarantees the overflow actually happens at any DATA_RATE_HZ.
 		//
-		// The source must stop advancing while full. Otherwise this test
-		// generator creates the same counter gaps it is intended to detect.
+		// The source must KEEP advancing while full — this image models a
+		// live bus, which cannot be stalled, so an unread sample is lost
+		// rather than held.  Queued data must still survive intact.
 		// ------------------------------------------------------------
-		stalls_before = stall_count;
+		drops_before = drop_count;
 		ticks_before = tick_count;
 		#(2 * dut.FIFO_DEPTH * SAMPLE_NS);   // no master activity
 
@@ -426,33 +427,34 @@ module spi_counter_stream_tb;
 			         dut.fifo_count, dut.FIFO_DEPTH);
 			errors = errors + 1;
 		end
-		if (stall_count <= stalls_before) begin
-			$display("FAIL: source was not stalled while the FIFO was full");
+		if (drop_count <= drops_before) begin
+			$display("FAIL: no samples dropped while the FIFO was full");
 			errors = errors + 1;
 		end
 		if (led_r !== 1'b0) begin
-			$display("FAIL: red LED not lit — FIFO backpressure never signalled");
+			$display("FAIL: red LED not lit — dropped samples never signalled");
 			errors = errors + 1;
 		end
-		counter_before_stall = dut.ascii_char;
+		counter_before_drops = dut.ascii_char;
 		#(8 * SAMPLE_NS);
-		if (dut.ascii_char !== counter_before_stall) begin
-			$display("FAIL: counter advanced while FIFO was full (0x%02x -> 0x%02x)",
-			         counter_before_stall, dut.ascii_char);
+		if (dut.ascii_char === counter_before_drops) begin
+			$display("FAIL: source stalled on a full FIFO; a live bus does not wait (0x%02x)",
+			         counter_before_drops);
 			errors = errors + 1;
 		end
-		$display("  stall window: %0d blocked samples, fifo_count = %0d",
-		         stall_count - stalls_before, dut.fifo_count);
+		$display("  drop window: %0d dropped samples, fifo_count = %0d",
+		         drop_count - drops_before, dut.fifo_count);
 
 		spi_burst(16);
 		dump_burst(16, "burst 2");
 
-		// Buffered data must survive backpressure intact and pick up exactly
-		// where burst 1 stopped. A full FIFO must never corrupt or reorder
-		// what is already queued.
+		// Buffered data must survive the overflow intact and pick up exactly
+		// where burst 1 stopped. A full FIFO drops the NEW sample; it must
+		// never corrupt or reorder what is already queued.  The samples lost
+		// during the window show up as a forward skip once this drains.
 		check_consecutive(16, "burst 2");
 		if (burst[0] !== last_of_burst1 + 8'd1) begin
-			$display("FAIL: stream not continuous across the stall (0x%02x -> 0x%02x)",
+			$display("FAIL: stream not continuous across the overflow (0x%02x -> 0x%02x)",
 			         last_of_burst1, burst[0]);
 			errors = errors + 1;
 		end

@@ -192,7 +192,7 @@ module spi_hw_stream_tb;
 	// Position in the endless "Hello World!Hello World!..." stream that the
 	// next byte off the link must correspond to.  Advances with every byte
 	// read, across bursts — the stream must stay continuous through CS
-	// toggles and through a FIFO-full stall.
+	// toggles and through a FIFO-full overflow.
 	integer stream_pos = 0;
 
 	top dut (
@@ -258,12 +258,12 @@ module spi_hw_stream_tb;
 		end
 	endtask
 
-	// Count source stalls straight off the design's internal strobe.
-	integer stall_count = 0;
-	integer stalls_before = 0;
-	reg [dut.MSG_IW-1:0] msg_idx_before_stall;
+	// Count dropped samples straight off the design's internal strobe.
+	integer drop_count = 0;
+	integer drops_before = 0;
+	reg [7:0] msg_idx_before_stall;
 	always @(posedge dut.clk_core)
-		if (dut.source_stalled) stall_count = stall_count + 1;
+		if (dut.sample_dropped) drop_count = drop_count + 1;
 
 	initial begin
 		if ($test$plusargs("vcd")) begin
@@ -297,51 +297,52 @@ module spi_hw_stream_tb;
 		check_stream(16, "burst 1");
 
 		// ------------------------------------------------------------
-		// Test 2: stop reading long enough for the FIFO to fill and stall the
-		// synthetic source (FIFO_DEPTH ticks to fill, then some margin).
+		// Test 2: stop reading long enough for the FIFO to fill and start
+		// dropping characters (FIFO_DEPTH ticks to fill, then some margin).
 		//
-		// The source must stop advancing while full. Otherwise this test
-		// generator creates the same message gaps it is intended to detect.
+		// The source must KEEP advancing while full — this image models a
+		// live bus, which cannot be stalled, so an unread character is lost
+		// rather than held.  Queued data must still survive intact.
 		// ------------------------------------------------------------
-		stalls_before = stall_count;
-		#((dut.FIFO_DEPTH + 16) * TICK_NS);   // full FIFO plus 16 blocked ticks
+		drops_before = drop_count;
+		#((dut.FIFO_DEPTH + 16) * TICK_NS);   // full FIFO plus 16 dropped ticks
 
 		if (dut.fifo_count !== dut.FIFO_DEPTH) begin
 			$display("FAIL: FIFO not full after stall (count = %0d, expected %0d)",
 			         dut.fifo_count, dut.FIFO_DEPTH);
 			errors = errors + 1;
 		end
-		if (stall_count <= stalls_before) begin
-			$display("FAIL: source was not stalled while the FIFO was full");
+		if (drop_count <= drops_before) begin
+			$display("FAIL: no characters dropped while the FIFO was full");
 			errors = errors + 1;
 		end
 		if (led_r !== 1'b0) begin
-			$display("FAIL: red LED not lit — FIFO backpressure never signalled");
+			$display("FAIL: red LED not lit — dropped characters never signalled");
 			errors = errors + 1;
 		end
 		msg_idx_before_stall = dut.msg_idx;
 		#(8 * TICK_NS);
-		if (dut.msg_idx !== msg_idx_before_stall) begin
-			$display("FAIL: message source advanced while FIFO was full (%0d -> %0d)",
-			         msg_idx_before_stall, dut.msg_idx);
+		if (dut.msg_idx === msg_idx_before_stall) begin
+			$display("FAIL: message source stalled on a full FIFO; a live bus does not wait (idx %0d)",
+			         msg_idx_before_stall);
 			errors = errors + 1;
 		end
-		$display("  stall window: %0d blocked characters, fifo_count = %0d",
-		         stall_count - stalls_before, dut.fifo_count);
+		$display("  drop window: %0d dropped characters, fifo_count = %0d",
+		         drop_count - drops_before, dut.fifo_count);
 
 		spi_burst(16);
 		dump_burst(16, "burst 2");
 
-		// Buffered data must survive backpressure intact and pick up exactly
-		// where burst 1 stopped. A full FIFO must never corrupt or reorder
-		// what is already queued.
+		// Buffered data must survive the overflow intact and pick up exactly
+		// where burst 1 stopped. A full FIFO drops the NEW character; it must
+		// never corrupt or reorder what is already queued.
 		check_stream(16, "burst 2");
 
 		// ...and the master should still be reading well behind the live
 		// source, which is what "the master is too slow" actually looks like:
 		// the FIFO was full, we took 16, so most of the backlog remains.
 		if (dut.fifo_count < dut.FIFO_DEPTH - 16) begin
-			$display("FAIL: expected a backlog after the stall, fifo_count = %0d",
+			$display("FAIL: expected a backlog after the overflow, fifo_count = %0d",
 			         dut.fifo_count);
 			errors = errors + 1;
 		end else begin
