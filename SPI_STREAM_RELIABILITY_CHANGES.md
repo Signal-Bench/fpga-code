@@ -26,8 +26,8 @@ general-fabric pins are used. The companion ESP32 firmware defaults to a 2 MHz
 SPI clock. Hardware captures showed that explicitly selecting the phase-1
 sample point increased one-to-zero MISO errors, so the firmware now retains
 the ESP32-H2 default sample point and restores a one-clock CS setup interval.
-Its 64-byte polling interval is reduced from 20 ms to 10 ms, increasing nominal
-read capacity from 3.2 kB/s to 6.4 kB/s for the 3 kB/s test source.
+Its polling interval is 10 ms. Length-prefixed 64-byte responses now carry up
+to 58 payload bytes, giving 5.8 kB/s capacity for the 3 kB/s test source.
 
 ## Changes
 
@@ -42,6 +42,11 @@ read capacity from 3.2 kB/s to 6.4 kB/s for the 3 kB/s test source.
 - Add command turnaround time and bounded mode-command retries on the MCU.
 - Add ready/mode command decoding and follow-up transaction ACKs.
 - Map SPI mode to ascending printable ASCII and DIO mode to `Hello World!`.
+- Add shared `53 42 52 <maximum>` READ / `53 42 44 <count>` response framing.
+- Snapshot each batch's valid-byte count and pop only its reserved payload.
+- Keep idle `FF` outside the payload without filtering real binary bytes.
+- Make ready commands available in both stream images; mode select remains
+  counter-only. The MCU no longer switches modes with BOOT or at startup.
 
 With this behavior, a counter jump or skipped message character is evidence
 of a transport or hard-SPI issue rather than an intentional generator drop.
@@ -56,15 +61,22 @@ PASS: all spi_hw_stream tests completed successfully
 ```
 
 The simulations cover normal sequencing, FIFO-full backpressure, source
-stalling, buffered-data integrity, and continuity across chip-select toggles.
+stalling, buffered-data integrity, continuity across chip-select toggles,
+empty/short/full packets, maximum request clamping, binary payloads, and
+control ACKs that do not consume FIFO bytes. Both FPGA images also build
+through synthesis, placement/routing at the Makefile's 30 MHz target, and
+bitstream packing. MCU parser sanitizer tests and the ESP-IDF build pass.
 
 ## Remaining Limitation
 
-`spi_counter_stream` now decodes the ready command and the temporary SPI/DIO
-test-pattern mode commands. `spi_hw_stream` remains stream-only and ignores
-MOSI. A mode is considered selected only after the command-capable image
-returns a valid ACK in the follow-up transaction.
+Both stream images decode READ and ready commands. `spi_counter_stream`
+also supports temporary SPI/DIO test-pattern mode commands; `spi_hw_stream`
+ignores mode select. Neither implements I2C/CAN/UART capture selection. See
+[`SPI_PACKET_PROTOCOL.md`](SPI_PACKET_PROTOCOL.md) for the wire contract.
+
+This format is incompatible with old raw-stream MCU readers. There is no CRC
+or retransmission: aborted reads and physical bit errors are not repaired.
 
 The behavioral `SB_SPI` model is not silicon-accurate. Final validation still
-requires synthesizing the bitstream and checking the stream on the target
-board at 2 MHz.
+requires programming the matching bitstream/MCU firmware and checking packet
+counts, prefix bytes, and stream continuity on the target board at 2 MHz.

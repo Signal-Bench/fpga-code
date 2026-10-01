@@ -27,12 +27,9 @@ endmodule
 //   * the SPI side is oversampled in the SBCLKI domain rather than being a
 //     true asynchronous SCK domain
 //   * transmit underrun shifts out 0xFF as a distinctive marker
-//   * NO LEADING DUMMY BYTE.  Real hardware needs one: FPGA-TN-02011
-//     Table 12.8 requires SPITXDR to be written >= 0.5 SCK periods before
-//     the first bit appears on SO, so a slave read always starts with a
-//     dummy.  This model hands over the first real byte immediately, so the
-//     "burst starts at 0x00" checks below are one byte optimistic versus
-//     silicon — on hardware, expect the counter to begin on byte 2.
+//   * no silicon-specific forced dummy byte; the holding register and shifter
+//     still model a prefetched idle FF before command responses. The host
+//     accepts up to two FF prefix bytes, which must be checked on hardware.
 // It models the one behaviour this design depends on: a single-deep transmit
 // holding register (SPITXDR) that feeds the shifter at each byte boundary,
 // with TRDY/RRDY status bits driving the handshake.
@@ -199,7 +196,7 @@ module spi_counter_stream_tb;
 
 	// One SPI burst: assert CS, clock n bytes MSB-first (mode 0), release CS.
 	reg [7:0] burst [0:63];
-	task spi_burst(input integer n);
+	task spi_wire_read(input integer n);
 		integer i, b;
 		reg [7:0] rx;
 		begin
@@ -224,34 +221,7 @@ module spi_counter_stream_tb;
 		end
 	endtask
 
-	// Send one four-byte protocol command. Its simultaneous MISO data is stream
-	// payload; the response is intentionally read in a following transaction.
-	task spi_command(input [7:0] opcode, input [7:0] argument);
-		integer i, b;
-		reg [7:0] tx;
-		begin
-			spi_cs = 1'b0;
-			#(HALF);
-			for (i = 0; i < 4; i = i + 1) begin
-				case (i)
-					0: tx = 8'h53;
-					1: tx = 8'h42;
-					2: tx = opcode;
-					default: tx = argument;
-				endcase
-				for (b = 7; b >= 0; b = b - 1) begin
-					spi_mosi = tx[b];
-					spi_sck = 1'b1;
-					#(HALF);
-					spi_sck = 1'b0;
-					#(HALF);
-				end
-			end
-			spi_cs = 1'b1;
-			spi_mosi = 1'b0;
-			#(HALF);
-		end
-	endtask
+	`include "../common/spi_stream_packet_tb_tasks.vh"
 
 	// Every byte in the burst must be exactly one more than the previous.
 	task check_consecutive(input integer n, input [127:0] label);
@@ -304,18 +274,18 @@ module spi_counter_stream_tb;
 	task check_hello_present(input integer n);
 		integer i, j;
 		integer found;
-		integer matches;
+		integer line_matches;
 		reg [7:0] expected;
 		begin
 			found = 0;
 			for (i = 0; i <= n - 13; i = i + 1) begin
-				matches = 1;
+				line_matches = 1;
 				for (j = 0; j < 13; j = j + 1) begin
 					expected = HELLO_LINE[8*(12-j) +: 8];
 					if (burst[i+j] !== expected)
-						matches = 0;
+						line_matches = 0;
 				end
-				if (matches)
+				if (line_matches)
 					found = 1;
 			end
 			if (!found) begin
@@ -389,7 +359,11 @@ module spi_counter_stream_tb;
 		// deep enough to serve a 16-byte burst but well short of the
 		// 64-entry depth, so the source is not stalled yet.
 		// ------------------------------------------------------------
-		#(CFG_NS + 24 * SAMPLE_NS);
+		#(CFG_NS);
+		spi_packet_read(58);
+		if (packet_len != 0)
+			$fatal(1, "initial empty queue returned data");
+		#(24 * SAMPLE_NS);
 
 		if (led_g !== 1'b0) begin
 			$display("FAIL: green LED not lit — hard SPI IP never finished configuring");
@@ -480,37 +454,38 @@ module spi_counter_stream_tb;
 
 		spi_command(8'hA5, 8'h5A);
 		#5000;
-		spi_burst(16);
+		spi_wire_read(16);
 		dump_burst(16, "ready ACK");
 		check_ready_ack;
 
 		// DIO is temporarily the Hello World test-pattern selector.
 		spi_command(8'h4D, 8'h02);
 		#5000;
-		spi_burst(16);
+		spi_wire_read(16);
 		dump_burst(16, "hello ACK");
 		check_mode_ack(8'h02, "hello");
 		#(24 * SAMPLE_NS);
-		spi_burst(32);
-		dump_burst(32, "hello stream");
-		check_hello_present(32);
+		spi_burst(24);
+		dump_burst(24, "hello stream");
+		check_hello_present(24);
 
 		// SPI selects ascending printable ASCII again.
 		spi_command(8'h4D, 8'h01);
 		#5000;
-		spi_burst(16);
+		spi_wire_read(16);
 		dump_burst(16, "ASCII ACK");
 		check_mode_ack(8'h01, "ASCII");
 		#(24 * SAMPLE_NS);
 		spi_burst(16);
 		dump_burst(16, "ASCII stream");
 		check_ascii_sequence(16);
+		check_packet_edges;
 
 		#1000;
 		if (errors == 0)
 			$display("PASS: all spi_counter_stream tests completed successfully");
 		else
-			$display("FAIL: %0d error(s)", errors);
+			$fatal(1, "FAIL: %0d error(s)", errors);
 		$finish;
 	end
 
@@ -519,8 +494,7 @@ module spi_counter_stream_tb;
 		// Scales with the design's sample rate for the same reason the waits
 		// above do; the fixed term covers the SPI bursts and config.
 		#(400 * dut.TICK_DIV * (1000.0 / 24.0) + 2_000_000);
-		$display("FAIL: testbench timeout");
-		$finish;
+		$fatal(1, "testbench timeout");
 	end
 
 endmodule

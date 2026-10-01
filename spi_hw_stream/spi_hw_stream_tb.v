@@ -27,12 +27,9 @@ endmodule
 //   * the SPI side is oversampled in the SBCLKI domain rather than being a
 //     true asynchronous SCK domain
 //   * transmit underrun shifts out 0xFF as a distinctive marker
-//   * NO LEADING DUMMY BYTE.  Real hardware needs one: FPGA-TN-02011
-//     Table 12.8 requires SPITXDR to be written >= 0.5 SCK periods before
-//     the first bit appears on SO, so a slave read always starts with a
-//     dummy.  This model hands over the first real byte immediately, so the
-//     "burst starts at 'H'" checks below are one byte optimistic versus
-//     silicon — on hardware, expect the message to begin on byte 2.
+//   * no silicon-specific forced dummy byte; the holding register and shifter
+//     still model a prefetched idle FF before command responses. The host
+//     accepts up to two FF prefix bytes, which must be checked on hardware.
 // It models the one behaviour this design depends on: a single-deep transmit
 // holding register (SPITXDR) that feeds the shifter at each byte boundary,
 // with TRDY/RRDY status bits driving the handshake.
@@ -206,7 +203,7 @@ module spi_hw_stream_tb;
 
 	// One SPI burst: assert CS, clock n bytes MSB-first (mode 0), release CS.
 	reg [7:0] burst [0:63];
-	task spi_burst(input integer n);
+	task spi_wire_read(input integer n);
 		integer i, b;
 		reg [7:0] rx;
 		begin
@@ -228,6 +225,8 @@ module spi_hw_stream_tb;
 			#(HALF);
 		end
 	endtask
+
+	`include "../common/spi_stream_packet_tb_tasks.vh"
 
 	// Every byte in the burst must be the next character of the message,
 	// continuing from wherever the stream left off.
@@ -261,7 +260,7 @@ module spi_hw_stream_tb;
 	// Count source stalls straight off the design's internal strobe.
 	integer stall_count = 0;
 	integer stalls_before = 0;
-	reg [dut.MSG_IW-1:0] msg_idx_before_stall;
+	integer msg_idx_before_stall;
 	always @(posedge dut.clk_core)
 		if (dut.source_stalled) stall_count = stall_count + 1;
 
@@ -277,6 +276,10 @@ module spi_hw_stream_tb;
 		// Let the IP get configured, then let the FIFO build a backlog
 		// that is well short of full (FIFO_DEPTH ticks to fill).
 		// ------------------------------------------------------------
+		#5000;
+		spi_packet_read(58);
+		if (packet_len != 0)
+			$fatal(1, "initial empty queue returned data");
 		#(20 * TICK_NS);   // ~20 characters queued, no drops yet
 
 		if (led_g !== 1'b0) begin
@@ -355,20 +358,20 @@ module spi_hw_stream_tb;
 		spi_burst(8);
 		dump_burst(8, "burst 3");
 		check_stream(8, "burst 3");
+		check_packet_edges;
 
 		#1000;
 		if (errors == 0)
 			$display("PASS: all spi_hw_stream tests completed successfully");
 		else
-			$display("FAIL: %0d error(s)", errors);
+			$fatal(1, "FAIL: %0d error(s)", errors);
 		$finish;
 	end
 
 	// safety net
 	initial begin
 		#((dut.FIFO_DEPTH * 4) * TICK_NS);
-		$display("FAIL: testbench timeout");
-		$finish;
+		$fatal(1, "testbench timeout");
 	end
 
 endmodule

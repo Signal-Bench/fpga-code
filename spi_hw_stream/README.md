@@ -14,29 +14,25 @@ needs (see [`../state_management.md`](../state_management.md)).
 The ASCII string `"Hello World!"` (12 bytes, one character per byte, no
 terminator) is emitted one character per tick at **3 kHz** (`DATA_RATE_HZ`),
 wrapping from `!` back to `H`. Each character is pushed into a 64-entry FIFO.
-A service state machine configures the hard IP, then keeps its transmit
-register loaded from the FIFO head, so every byte the master clocks out is the
-next character of the message.
+A service state machine configures the hard IP and returns length-prefixed
+batches on request, then sends idle `FF` without consuming queued data. See
+[`../SPI_PACKET_PROTOCOL.md`](../SPI_PACKET_PROTOCOL.md) for the shared wire
+contract. Program the matching FPGA and MCU firmware together.
 
-**A working link looks like the string repeating back-to-back** on the
-master/analyzer: `48 65 6c 6c 6f 20 57 6f 72 6c 64 21 48 65 ...` — an
-analyzer with ASCII decode shows `Hello World!Hello World!...`.
+```text
+MCU -> FPGA: 53 42 52 3A   request up to 58 queued bytes
+FPGA -> MCU: [idle FF prefix] 53 42 44 <count> <payload> [idle FF padding]
+```
 
-Because this design keeps `SPITXDR` pre-loaded at all times, it matches
-FPGA-TN-02011 **Figure 15.1** (*iCE40 UltraPlus as SPI Slave*) — the pre-loaded
-byte goes straight to SO when CS asserts, so the message appears from byte one.
-The dummy-byte overhead in Table 12.8 / Figure 15.2 applies to
-command-response protocols, where the slave can't know what to send until it
-decodes an incoming command. This design has nothing to decode.
+The command and response use separate transactions, with at least 20 us
+between them. Only the declared payload is the repeating message:
+`48 65 6c 6c 6f 20 57 6f 72 6c 64 21 48 65 ...`. Empty polls return count
+zero. The ready command `53 42 A5 5A` returns `53 42 4F 4B`; mode-select
+commands are ignored by this fixed-message image.
 
-**The exception is an empty `SPITXDR` at the start of a transaction.**
-Figure 15.2 documents a *silicon limitation* there: the second byte out is
-forced to `0xFF` regardless of what you write, and good data only appears in
-the third byte period. That window exists at power-on (before the first
-tick, ~333 µs at 3 kHz) or any time the FIFO runs dry. If that's awkward,
-`SPICR2[SDBRE]` (bit 5) makes it deterministic: `0xFF` until data is ready,
-then a single `0x00` marker, then the real stream — giving the master
-something to sync on.
+`SPITXDR` remains loaded with idle bytes outside responses. Up to two
+prefetched idle `FF` bytes may precede the header. `SDBRE` remains disabled;
+the packet header/count replaces the hardware's optional zero marker.
 
 ## Wiring
 
@@ -49,8 +45,8 @@ lands on gpio_13 (the pin `host_to_spi.v` already uses for MISO).
 |---|---|---|---|
 | SCK  | gpio_11 | FPGA in  | master supplies the clock |
 | CS   | gpio_19 | FPGA in  | active low |
-| MOSI | gpio_21 | FPGA in  | ignored by this test |
-| MISO | gpio_13 | FPGA out | the message stream |
+| MOSI | gpio_21 | FPGA in  | READ and ready commands |
+| MISO | gpio_13 | FPGA out | counted message batches and ready ACK |
 | flash CS | 16 | FPGA out | held high to keep the onboard flash off the bus |
 
 SPI mode 0 (CPOL=0, CPHA=0), **MSB-first** — matching `notes.md` and the rest
@@ -63,8 +59,9 @@ and the FTDI programmer off this bus. The cost is routing delay — see below.
 ## Rates and backpressure
 
 The message source produces **3 kB/s**. The master only keeps up if it
-sustains **≥ 24 kbit/s** of SPI clock (plus margin for gaps between
-transactions). Below that the FIFO fills and pauses the synthetic message
+sustains **≥ 24 kbit/s** of payload clock plus overhead and transaction gaps.
+The default 58-byte maximum every 10 ms gives 5.8 kB/s payload capacity.
+Below the source rate the FIFO fills and pauses the synthetic message
 source. Queued data is never overwritten or reordered, and the message index
 does not advance until FIFO space is available.
 
@@ -75,7 +72,8 @@ backpressure preserves a consecutive message. So:
 - **Red LED on** → the message source is paused because the master is too slow.
 - **The string skips forward mid-word** (`Hello Wold!`) → the SPI path lost
   or skipped a byte.
-- **`0xFF` runs / repeated or garbled characters** → something is actually wrong.
+- **`0xFF` outside the declared payload** is normal idle padding.
+- **`0xFF` inside the message / repeated or garbled characters** indicate a link issue.
 
 `DATA_RATE_HZ` in the source sets the rate; the 3 kHz here was chosen so a
 slow master can track it without drops.
@@ -85,23 +83,22 @@ slow master can track it without drops.
 | LED | Meaning |
 |---|---|
 | GREEN | hard SPI IP finished configuring (should light immediately at power-on) |
-| BLUE  | pulses when a byte is handed to the IP — master is clocking |
+| BLUE  | pulses when a payload byte is handed to the IP |
 | RED   | pulses while FIFO backpressure stalls the message source |
 
 ## Commands
 
 ```
-make sim     # testbench: verifies sequencing, backpressure, and CS-boundary continuity
+make sim     # verifies packet counts, binary bytes, commands, sequencing, backpressure
 make wave    # same, with a GTKWave dump
 make build   # bitstream
 make time    # static timing (icetime cannot analyze the SPI/HFOSC hard cells — expected warnings)
 make flash   # program over FTDI
 ```
 
-Current build: 1078 LC (20%), 1 of 2 `SB_SPI` blocks, no EBR. Core clock
-24 MHz, Fmax 35.5 MHz. The LC count is mostly the register-based FIFO's
-combinational read; moving it to an inferred EBR would cut it substantially at
-the cost of handling the read-during-write hazard.
+Run `make build` for current utilization and timing. The packet path still
+uses a register-based FIFO, one `SB_SPI` block, and no EBR. Core clock is
+24 MHz; the Makefile requests 30 MHz placement margin.
 
 ## Register settings, verified against the datasheet
 
@@ -147,8 +144,7 @@ behavior:
    dedicated pins 14/15/16/17 avoid the routing detour (at the cost of sharing
    with the flash and FTDI), and `SPICR1[4]` TXEDGE exists for fast SPI.
 
-   ESP32-H2 masters must use the standard mode-0 rising-edge sample point
-   (`SPI_SAMPLING_POINT_PHASE_1`). Its zero-initialized default delays sampling
-   by half a cycle, landing on the falling edge where this design changes MISO.
-   Hardware captures with that default showed rare bytes with bit 7 sampled
-   high, which an ASCII decoder made look like missing characters.
+   The companion ESP32-H2 firmware retains its default sample point and a
+   one-clock CS setup/hold time. A phase-1 override increased one-to-zero
+   MISO errors in the user's captures. Packet framing removes idle padding
+   from mobile payloads but does not correct physical bit errors.

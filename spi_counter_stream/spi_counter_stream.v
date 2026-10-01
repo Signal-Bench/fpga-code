@@ -10,21 +10,10 @@
  * "Hello World!" followed by LF. SPI mode-select commands switch between the
  * two patterns and receive a four-byte acknowledgement on the next transfer.
  *
- * Leading bytes: this design keeps SPITXDR pre-loaded at all times, which is
- * the "fully specified" case of FPGA-TN-02011 Figure 15.1 (iCE40 UltraPlus
- * as SPI Slave) — the pre-loaded byte goes straight to SO when CS asserts, so
- * the stream should appear from the very first byte.  The dummy-byte
- * overhead described in Table 12.8 / Figure 15.2 applies to responses that
- * cannot be known until an incoming command has been decoded. This design
- * therefore returns command ACKs in a separate follow-up transaction.
- *
- * BUT if SPITXDR is empty when a transaction starts, Figure 15.2 documents a
- * silicon limitation: the second byte out is forced to 0xFF regardless, and
- * good data only appears in the third byte period.  That can happen here at
- * power-on (before the first DATA_RATE_HZ tick lands, ~333 us at 3 kHz) or
- * any time the FIFO
- * runs dry.  SPICR2[SDBRE] turns that window into a deterministic
- * 0xFF.../0x00-marker/data framing instead — see the CFG_SPICR2 comment.
+ * Packets: 53 42 52 <limit> reserves a FIFO snapshot; the follow-up transfer
+ * returns 53 42 44 <count> + data, with at most two idle FF bytes before it.
+ * The TX register is kept loaded with idle FF outside responses. Only payload
+ * writes pop the FIFO. See ../SPI_PACKET_PROTOCOL.md for the host contract.
  *
  * Producer/consumer rates: the source produces DATA_RATE_HZ bytes/s, so the
  * master must sustain at least 8 * DATA_RATE_HZ bits/s of SPI clock to keep
@@ -36,8 +25,10 @@
  * Debug LEDs (active low on the UPduino):
  *   RED:   on while the synthetic source is stalled by a full FIFO
  *   GREEN: on once the hard SPI IP has been configured
- *   BLUE:  pulses when a byte is handed to the IP (master is clocking)
+ *   BLUE:  pulses when a payload byte is handed to the IP
  */
+`include "../common/spi_stream_packet.v"
+
 module top (
 	input  wire spi_sck,       // gpio_11 — SCK in from master
 	input  wire spi_cs,        // gpio_19 — CS in from master (active low)
@@ -100,7 +91,8 @@ module top (
 	localparam [8*MSG_LEN-1:0]  MSG     = "Hello World!\n";
 	localparam integer          MSG_IW  = $clog2(MSG_LEN);
 
-	reg                        mode_hello = 1'b0;
+	wire [7:0]                 packet_mode;
+	wire                       mode_hello = (packet_mode == 8'h02);
 	reg  [7:0]                 ascii_char = 8'h20;
 	reg  [MSG_IW-1:0]          msg_idx = 0;
 	wire [7:0]                 msg_byte = MSG[8*(MSG_LEN-1-msg_idx) +: 8];
@@ -115,10 +107,10 @@ module top (
 	wire       fifo_empty = (fifo_count == 0);
 	wire [7:0] fifo_head  = fifo_mem[fifo_rd];
 
-	reg  mode_switch = 1'b0;
+	wire mode_switch;
 	wire fifo_push = tick & ~fifo_full & ~mode_switch;
 	wire source_stalled = tick & fifo_full;
-	reg  fifo_pop;   // single-cycle pulse, driven by the SPI service FSM
+	wire fifo_pop;
 
 	always @(posedge clk_core) begin
 		if (mode_switch) begin
@@ -192,8 +184,8 @@ module top (
 	// Bit5 (SDBRE) is worth knowing about: it turns on Lattice's dummy
 	// byte response, where the slave sends 0xFF until the first SPITXDR
 	// write, then a single 0x00 marker, then real data — giving the master
-	// a deterministic "data starts here" byte to sync on.  Left off here to
-	// keep the raw stream simple; set 8'b0010_0000 to try it.
+	// a deterministic "data starts here" byte to sync on. Keep it off: the
+	// packet protocol uses a header/count and accepts only FF idle prefixes.
 	localparam [7:0] CFG_SPICR2 = 8'b0000_0000;
 
 	// SPIBR (Table 12.5): DIVIDER must be >= 1 per the datasheet.  Only
@@ -234,31 +226,11 @@ module top (
 	// and declare spi_miso as inout.
 	assign spi_miso = so_data;
 
-	// Commands are sent in one transaction; responses are shifted out at the
-	// front of the following transaction because an SPI slave cannot answer a
-	// byte before receiving it. SPI mode selects ascending ASCII, while DIO
-	// selects Hello World for this temporary two-pattern bring-up image.
-	localparam [7:0] PROTO_MAGIC_0  = 8'h53,
-	                 PROTO_MAGIC_1  = 8'h42,
-	                 PROTO_READY_0  = 8'hA5,
-	                 PROTO_READY_1  = 8'h5A,
-	                 PROTO_MODE_CMD = 8'h4D,
-	                 PROTO_READY_0_ACK = 8'h4F,
-	                 PROTO_READY_1_ACK = 8'h4B,
-	                 PROTO_MODE_ACK = 8'h41,
-	                 MODE_ASCII = 8'h01,
-	                 MODE_HELLO = 8'h02;
-
-	reg [1:0]  command_pos = 0;
-	reg [7:0]  command_opcode = 0;
-	reg [31:0] response_word = 0;
-	reg [2:0]  response_count = 0;
-	wire [7:0] response_byte = response_word[31:24];
-	wire       response_pending = (response_count != 0);
+	wire [7:0] packet_tx_byte;
 
 	// ----------------------------------------------------------------
 	// Service state machine: configure the IP, then keep its transmit
-	// register fed from the FIFO and drain its receive register so the
+	// register fed with packet bytes or idle FF and drain its RX register so the
 	// overrun flag never latches up.
 	//
 	// Refill deadline (FPGA-TN-02011 Table 12.8): as a slave, SPITXDR must
@@ -280,10 +252,16 @@ module top (
 	reg [3:0] state = S_CR0;
 	wire      spi_ready = (state >= S_POLL);
 
+	spi_stream_packet #(.ENABLE_MODE_SELECT(1)) u_packet (
+		.clk(clk_core),
+		.rx_valid(state == S_DRAIN_RX && spi_ack), .rx_byte(spi_dato),
+		.tx_accept(state == S_LOAD_TX && spi_ack), .tx_byte(packet_tx_byte),
+		.fifo_count(fifo_count), .fifo_head(fifo_head), .fifo_pop(fifo_pop),
+		.mode_switch(mode_switch), .mode(packet_mode)
+	);
+
 	always @(posedge clk_core) begin
 		spi_stb  <= 1'b0;
-		fifo_pop <= 1'b0;
-		mode_switch <= 1'b0;
 
 		case (state)
 			// -- configuration writes --
@@ -324,7 +302,7 @@ module top (
 					// setting ROE and losing MOSI bytes on real silicon.
 					if (spi_dato[SR_RRDY])
 						state <= S_DRAIN_RX;
-					else if (spi_dato[SR_TRDY] && (response_pending || !fifo_empty))
+					else if (spi_dato[SR_TRDY])
 						state <= S_LOAD_TX;
 					else
 						state <= S_POLL;
@@ -333,16 +311,10 @@ module top (
 
 			S_LOAD_TX: begin
 				spi_adr <= ADDR_SPITXDR;
-				spi_dati <= response_pending ? response_byte : fifo_head;
+				spi_dati <= packet_tx_byte;
 				spi_stb <= 1'b1; spi_rw <= 1'b1;
 				if (spi_ack) begin
 					spi_stb <= 1'b0;
-					if (response_pending) begin
-						response_word  <= {response_word[23:0], 8'h00};
-						response_count <= response_count - 1'b1;
-					end else begin
-						fifo_pop <= 1'b1;
-					end
 					state <= S_POLL;
 				end
 			end
@@ -353,41 +325,6 @@ module top (
 				if (spi_ack) begin
 					spi_stb <= 1'b0;
 					state <= S_POLL;
-					case (command_pos)
-						2'd0: begin
-							if (spi_dato == PROTO_MAGIC_0)
-								command_pos <= 2'd1;
-						end
-						2'd1: begin
-							if (spi_dato == PROTO_MAGIC_1)
-								command_pos <= 2'd2;
-							else
-								command_pos <= (spi_dato == PROTO_MAGIC_0) ? 2'd1 : 2'd0;
-						end
-						2'd2: begin
-							if (spi_dato == PROTO_READY_0 || spi_dato == PROTO_MODE_CMD) begin
-								command_opcode <= spi_dato;
-								command_pos <= 2'd3;
-							end else begin
-								command_pos <= (spi_dato == PROTO_MAGIC_0) ? 2'd1 : 2'd0;
-							end
-						end
-						2'd3: begin
-							command_pos <= 2'd0;
-							if (command_opcode == PROTO_READY_0 && spi_dato == PROTO_READY_1) begin
-								response_word <= {PROTO_MAGIC_0, PROTO_MAGIC_1,
-								                  PROTO_READY_0_ACK, PROTO_READY_1_ACK};
-								response_count <= 3'd4;
-							end else if (command_opcode == PROTO_MODE_CMD &&
-							             (spi_dato == MODE_ASCII || spi_dato == MODE_HELLO)) begin
-								mode_hello <= (spi_dato == MODE_HELLO);
-								mode_switch <= 1'b1;
-								response_word <= {PROTO_MAGIC_0, PROTO_MAGIC_1,
-								                  PROTO_MODE_ACK, spi_dato};
-								response_count <= 3'd4;
-							end
-						end
-					endcase
 				end
 			end
 

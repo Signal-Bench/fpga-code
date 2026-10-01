@@ -9,27 +9,14 @@
  * Test payload: the ASCII string "Hello World!" (MSG_LEN = 12 bytes, one
  * character per byte, no terminator), emitted at up to DATA_RATE_HZ and
  * wrapping from '!' back to 'H'. Each character is pushed
- * into a FIFO; the SPI service state machine keeps the hard IP's transmit
- * register loaded from the FIFO head, so whatever byte the master clocks out
- * is the next character of the message.  A correctly working link shows the
- * string repeating back-to-back on the master side:
+ * into a FIFO. Counted packet payloads concatenate into the repeating string:
  *   48 65 6c 6c 6f 20 57 6f 72 6c 64 21 48 65 ...
  *
- * Leading bytes: this design keeps SPITXDR pre-loaded at all times, which is
- * the "fully specified" case of FPGA-TN-02011 Figure 15.1 (iCE40 UltraPlus
- * as SPI Slave) — the pre-loaded byte goes straight to SO when CS asserts, so
- * the message should appear from the very first byte.  The dummy-byte
- * overhead described in Table 12.8 / Figure 15.2 applies to command-response
- * protocols, where the slave cannot know what to send until it has decoded an
- * incoming command; this design has nothing to decode.
- *
- * BUT if SPITXDR is empty when a transaction starts, Figure 15.2 documents a
- * silicon limitation: the second byte out is forced to 0xFF regardless, and
- * good data only appears in the third byte period.  That can happen here at
- * power-on (before the first DATA_RATE_HZ tick lands, ~333 us at 3 kHz) or
- * any time the FIFO runs dry.  SPICR2[SDBRE] turns that window into a
- * deterministic 0xFF.../0x00-marker/data framing instead — see the
- * CFG_SPICR2 comment.
+ * Packets: 53 42 52 <limit> reserves a FIFO snapshot; the follow-up transfer
+ * returns 53 42 44 <count> + data, with at most two idle FF bytes before it.
+ * The TX register is kept loaded with idle FF outside responses. Only payload
+ * writes pop the FIFO. The ready command is supported; mode select is ignored.
+ * See ../SPI_PACKET_PROTOCOL.md for the host contract.
  *
  * Producer/consumer rates: the message source produces DATA_RATE_HZ bytes/s,
  * so the master must sustain at least 8 * DATA_RATE_HZ bits/s of SPI clock to
@@ -41,13 +28,15 @@
  * Debug LEDs (active low on the UPduino):
  *   RED:   on while the synthetic source is stalled by a full FIFO
  *   GREEN: on once the hard SPI IP has been configured
- *   BLUE:  pulses when a byte is handed to the IP (master is clocking)
+ *   BLUE:  pulses when a payload byte is handed to the IP
  */
+`include "../common/spi_stream_packet.v"
+
 module top (
 	input  wire spi_sck,       // gpio_11 — SCK in from master
 	input  wire spi_cs,        // gpio_19 — CS in from master (active low)
-	input  wire spi_mosi,      // gpio_21 — MOSI in from master (ignored here)
-	output wire spi_miso,      // gpio_13 — MISO out to master (message stream)
+	input  wire spi_mosi,      // gpio_21 - commands in from master
+	output wire spi_miso,      // gpio_13 - packets and ACKs out to master
 	output wire spi_cs_flash,  // pin 16  — hold the onboard flash deselected
 	output wire led_r,
 	output wire led_g,
@@ -126,7 +115,7 @@ module top (
 
 	wire fifo_push = tick & ~fifo_full;
 	wire source_stalled = tick & fifo_full;
-	reg  fifo_pop;   // single-cycle pulse, driven by the SPI service FSM
+	wire fifo_pop;
 
 	always @(posedge clk_core) begin
 		if (fifo_push) begin
@@ -186,8 +175,8 @@ module top (
 	// Bit5 (SDBRE) is worth knowing about: it turns on Lattice's dummy
 	// byte response, where the slave sends 0xFF until the first SPITXDR
 	// write, then a single 0x00 marker, then real data — giving the master
-	// a deterministic "data starts here" byte to sync on.  Left off here to
-	// keep the raw stream simple; set 8'b0010_0000 to try it.
+	// a deterministic "data starts here" byte to sync on. Keep it off: the
+	// packet protocol uses a header/count and accepts only FF idle prefixes.
 	localparam [7:0] CFG_SPICR2 = 8'b0000_0000;
 
 	// SPIBR (Table 12.5): DIVIDER must be >= 1 per the datasheet.  Only
@@ -230,7 +219,7 @@ module top (
 
 	// ----------------------------------------------------------------
 	// Service state machine: configure the IP, then keep its transmit
-	// register fed from the FIFO and drain its receive register so the
+	// register fed with packet bytes or idle FF and drain its RX register so the
 	// overrun flag never latches up.
 	//
 	// Refill deadline (FPGA-TN-02011 Table 12.8): as a slave, SPITXDR must
@@ -251,10 +240,18 @@ module top (
 
 	reg [3:0] state = S_CR0;
 	wire      spi_ready = (state >= S_POLL);
+	wire [7:0] packet_tx_byte;
+
+	spi_stream_packet u_packet (
+		.clk(clk_core),
+		.rx_valid(state == S_DRAIN_RX && spi_ack), .rx_byte(spi_dato),
+		.tx_accept(state == S_LOAD_TX && spi_ack), .tx_byte(packet_tx_byte),
+		.fifo_count(fifo_count), .fifo_head(fifo_head), .fifo_pop(fifo_pop),
+		.mode_switch(), .mode()
+	);
 
 	always @(posedge clk_core) begin
 		spi_stb  <= 1'b0;
-		fifo_pop <= 1'b0;
 
 		case (state)
 			// -- configuration writes --
@@ -290,21 +287,20 @@ module top (
 				spi_stb <= 1'b1; spi_rw <= 1'b0;
 				if (spi_ack) begin
 					spi_stb <= 1'b0;
-					if (spi_dato[SR_TRDY] && !fifo_empty)
-						state <= S_LOAD_TX;
-					else if (spi_dato[SR_RRDY])
+					if (spi_dato[SR_RRDY])
 						state <= S_DRAIN_RX;
+					else if (spi_dato[SR_TRDY])
+						state <= S_LOAD_TX;
 					else
 						state <= S_POLL;
 				end
 			end
 
 			S_LOAD_TX: begin
-				spi_adr <= ADDR_SPITXDR; spi_dati <= fifo_head;
+				spi_adr <= ADDR_SPITXDR; spi_dati <= packet_tx_byte;
 				spi_stb <= 1'b1; spi_rw <= 1'b1;
 				if (spi_ack) begin
 					spi_stb  <= 1'b0;
-					fifo_pop <= 1'b1;   // byte now belongs to the IP
 					state    <= S_POLL;
 				end
 			end
