@@ -1,69 +1,67 @@
 /** \file
- * SignalBench STREAM decoders: raw bytes out, no framing.
+ * SignalBench STREAM decoders, framed.
  *
- * Every module here emits a plain byte stream -- out_stb pulses for one core
- * clock with the byte on out_byte, at most one byte per clock.  There are no
- * record headers, lengths or timestamps; what goes into the FIFO is what the
- * MCU reads off MISO.  See README.md for what "raw" means per protocol.
+ * Each decoder drives the framer (sbs_framer.v) with one op per clock:
+ *   op_kind 0 BYTE(b)   append a payload byte
+ *   op_kind 2 CLOSE(c)  end the frame; c = 1 marks the next frame CONT
  *
- * This is deliberately different from ../final_system/, whose decoders emit
- * structured events (flags + payload) into a framed record packer.  The
- * stream version reuses the PROVEN capture logic of the original sniffers
- * instead, because "raw" here means "what those sniffers produced":
+ * The payload each one produces is specified in MCU_FRAME_FORMAT.md.
  *
- *   sbs_i2c   port of i2c_sniffer.v's capture FSM, unchanged in behaviour
- *   sbs_uart  the two uart_rx receivers from uart_to_spi.v, unchanged
- *   sbs_spi   ../final_system/sb_decoders.v :: sb_spi, two bytes per pair
- *   sbs_dio   new -- one byte per edge
- *   sbs_can   can_bit_timing + can_frame_fsm, can_sniffer.v's 20-byte record
+ * The capture logic underneath is unchanged from the unframed version:
+ *   sbs_i2c   port of i2c_sniffer.v's capture FSM
+ *   sbs_uart  the two uart_rx receivers from uart_to_spi.v
+ *   sbs_spi   ../final_system/sb_decoders.v :: sb_spi
+ *   sbs_dio   new
+ *   sbs_can   can_bit_timing + can_frame_fsm
+ *
+ * Decoders that can produce long frames (I2C, SPI) split them themselves
+ * rather than letting the framer do it, because only the decoder knows what
+ * a payload must end with (I2C's info trailer, SPI's whole pairs).
  */
 
+`define OP_BYTE  2'd0
+`define OP_CLOSE 2'd2
+
 // ====================================================================
-// I2C -- raw packed SDA bitstream, ACK bits included.
+// I2C -- one frame per START-delimited segment.
 //
-// A port of i2c_sniffer.v's CAPTURE state machine, keeping its behaviour
-// bit for bit, including the three fixes recorded in i2c_sniffer.md:
-//   - repeated START flushes a partial byte, then marks the START
-//   - ACK-immediately-before-STOP: when STOP and the last scl_rising land
-//     in the same sample, the last bit is folded in before flushing
-//   - 1 ms idle timeout while active, recovering from a missed STOP
+// Payload:  [packed SDA bits ...] [info]
 //
-// What is removed is everything downstream of capture: the 4x128-byte
-// ping-pong RAM, the drain queue and the SPI master.  Bytes go straight
-// to the stream instead.
+//   Packed bits: every SCL-rising SDA sample, ACK/NACK bits included, 8 per
+//   byte, MSB first -- exactly i2c_sniffer.v's raw bitstream.  The last data
+//   byte is left-aligned and zero-padded if the segment didn't end on a
+//   byte boundary, which it usually doesn't: 9 bits per I2C byte.
 //
-// Output byte sequence for one transaction is the same as what
-// i2c_sniffer.v drained for it, with ONE intentional difference in where
-// the leading 0xFF comes from:
+//   info:  bit7    RSTART   this segment began with a repeated START
+//          bit6:5  END      00 STOP, 01 repeated START, 10 idle timeout
+//                           (no STOP for 1 ms), 11 split: continues in the
+//                           next frame, which has CONT set
+//          bit4:3  0
+//          bit2:0  number of valid bits in the last data byte; 0 = all 8.
+//                  If the payload is only the info byte, there are none.
 //
-//   i2c_sniffer.v:  the DRAIN prepends 0xFF to each completed capture
-//   here:           0xFF is emitted at the START itself
+// A repeated START ends the frame and starts a new one with RSTART set,
+// instead of i2c_sniffer.v's in-band 0xFF marker -- a marker can't be told
+// apart from a data 0xFF, a frame boundary can.  A write-then-read register
+// access is therefore two frames: [... END=01] then [RSTART=1 ...].
 //
-// Consequences of streaming rather than buffering a whole transaction:
-//   - a START followed by STOP with no data emits a lone 0xFF; the original
-//     dropped empty captures (final_len == 0) and sent nothing
-//   - an idle timeout can't take back bytes already streamed; the original
-//     abandoned the whole buffer
-//   - there is no 128-byte per-transaction limit; the FIFO bounds it instead
-//
-// START_MARKER = 0 suppresses the 0xFF markers entirely, if you would rather
-// have nothing but bus bits.
+// Capture logic kept from i2c_sniffer.v: 3-stage synchronizers, START/STOP
+// derivation, the ACK-before-STOP fix (stop_also_scl), the 1 ms idle timeout.
 // ====================================================================
 module sbs_i2c #(
-	parameter integer CORE_HZ      = 24_000_000,
-	parameter integer START_MARKER = 1
+	parameter integer CORE_HZ = 24_000_000,
+	parameter integer MAXP    = 255
 )(
 	input  wire       clk,
 	input  wire       rst,
 	input  wire       scl_pin,
 	input  wire       sda_pin,
-	output reg        out_stb,
-	output reg  [7:0] out_byte
+	output reg        op_stb,
+	output reg  [1:0] op_kind,
+	output reg  [7:0] op_data
 );
-	localparam integer IDLE_TIMEOUT_CYCLES = CORE_HZ / 1000;    // 1 ms, as before
-	localparam [7:0]   MARKER = 8'hFF;
+	localparam integer IDLE_TIMEOUT_CYCLES = CORE_HZ / 1000;
 
-	// -- 3-stage synchronizers + edges, identical to i2c_sniffer.v --------
 	reg [2:0] scl_sync = 3'b111;
 	reg [2:0] sda_sync = 3'b111;
 	always @(posedge clk) begin
@@ -79,15 +77,14 @@ module sbs_i2c #(
 	wire stop_cond    = sda_rising  & scl_sync[1];
 	wire bus_activity = scl_rising | scl_falling | sda_rising | sda_falling;
 
-	reg        capture_state     = 1'b0;   // 0 = IDLE, 1 = ACTIVE
-	reg [2:0]  bit_count         = 3'd0;
-	reg [7:0]  shift_reg         = 8'd0;
-	reg [15:0] idle_hi_ctr       = 16'd0;
-	reg        rpt_start_pending = 1'b0;
+	reg        capture_state = 1'b0;
+	reg [2:0]  bit_count     = 3'd0;
+	reg [7:0]  shift_reg     = 8'd0;
+	reg [15:0] idle_hi_ctr   = 16'd0;
+	reg [8:0]  dcount        = 9'd0;   // data bytes in the current frame
+	reg        rstart        = 1'b0;   // current segment began with rSTART
 
-	// -- STOP corner case, identical to i2c_sniffer.v ---------------------
-	// stop_cond and scl_rising can assert in the same cycle when the last
-	// ACK/NACK bit lands right as SDA rises for STOP (i2c_sniffer.md bug 3).
+	// i2c_sniffer.v's STOP corner case, unchanged
 	wire [7:0] next_sda       = {shift_reg[6:0], sda_sync[1]};
 	wire       stop_also_scl  = stop_cond & scl_rising;
 	wire [7:0] stop_sr        = stop_also_scl ? next_sda : shift_reg;
@@ -101,84 +98,109 @@ module sbs_i2c #(
 	wire idle_timeout = (capture_state == 1'b1) & scl_sync[1] & ~bus_activity
 	                  & (idle_hi_ctr == IDLE_TIMEOUT_CYCLES - 1);
 
+	// Tail sequencer: an ending segment needs up to three ops (last byte,
+	// info, CLOSE) but the output carries one per clock.  The bus can't
+	// produce another event within two clocks of any segment end.
+	reg [1:0] tail     = 2'd0;   // ops still to send: 2 = info+close, 1 = close
+	reg [7:0] tail_inf = 8'd0;
+	reg       tail_c   = 1'b0;
+
+	task emit(input [1:0] kd, input [7:0] dt);
+		begin op_stb <= 1'b1; op_kind <= kd; op_data <= dt; end
+	endtask
+
+	// End the segment: optional last byte now, then info and CLOSE.
+	task end_seg(input has_byte, input [7:0] b, input [7:0] inf, input cont);
+		begin
+			if (has_byte) begin
+				emit(`OP_BYTE, b);
+				tail <= 2'd2;
+			end else begin
+				emit(`OP_BYTE, inf);
+				tail <= 2'd1;
+			end
+			tail_inf <= inf;
+			tail_c   <= cont;
+			dcount   <= 9'd0;
+		end
+	endtask
+
 	always @(posedge clk) begin
-		out_stb <= 1'b0;
+		op_stb <= 1'b0;
 
 		if (rst) begin
-			capture_state     <= 1'b0;
-			bit_count         <= 3'd0;
-			shift_reg         <= 8'd0;
-			idle_hi_ctr       <= 16'd0;
-			rpt_start_pending <= 1'b0;
+			capture_state <= 1'b0;
+			bit_count     <= 3'd0;
+			shift_reg     <= 8'd0;
+			idle_hi_ctr   <= 16'd0;
+			dcount        <= 9'd0;
+			rstart        <= 1'b0;
+			tail          <= 2'd0;
 		end else begin
-			// -- idle-high timeout counter --
 			if (capture_state == 1'b1 && scl_sync[1] && !bus_activity)
 				idle_hi_ctr <= idle_hi_ctr + 16'd1;
 			else
 				idle_hi_ctr <= 16'd0;
 
+			// -- finish a segment's tail first --
+			if (tail == 2'd2) begin
+				emit(`OP_BYTE, tail_inf);
+				tail <= 2'd1;
+			end else if (tail == 2'd1) begin
+				emit(`OP_CLOSE, {7'd0, tail_c});
+				tail <= 2'd0;
+			end
+
 			if (idle_timeout) begin
-				bit_count         <= 3'd0;
-				shift_reg         <= 8'd0;
-				rpt_start_pending <= 1'b0;
-				capture_state     <= 1'b0;
+				// END=10, flushing any partial bits.
+				end_seg(bit_count != 3'd0,
+				        shift_reg << (4'd8 - {1'b0, bit_count}),
+				        {rstart, 2'b10, 2'b00, bit_count}, 1'b0);
+				bit_count     <= 3'd0;
+				shift_reg     <= 8'd0;
+				capture_state <= 1'b0;
 
 			end else if (capture_state == 1'b0) begin
-				// CAP_IDLE
-				bit_count         <= 3'd0;
-				shift_reg         <= 8'd0;
-				rpt_start_pending <= 1'b0;
+				bit_count <= 3'd0;
+				shift_reg <= 8'd0;
 				if (start_cond) begin
 					capture_state <= 1'b1;
-					// This 0xFF is the one i2c_sniffer.v's drain prepended.
-					if (START_MARKER != 0) begin
-						out_byte <= MARKER;
-						out_stb  <= 1'b1;
-					end
+					rstart        <= 1'b0;
+					dcount        <= 9'd0;
 				end
 
 			end else begin
-				// CAP_ACTIVE
-				if (rpt_start_pending) begin
-					// Second cycle of a repeated START: the deferred marker.
-					rpt_start_pending <= 1'b0;
-					if (START_MARKER != 0) begin
-						out_byte <= MARKER;
-						out_stb  <= 1'b1;
-					end
-
-				end else if (stop_cond) begin
-					// Flush the last partial/complete byte, left-aligned.
-					if (has_stop_byte) begin
-						out_byte <= stop_byte;
-						out_stb  <= 1'b1;
-					end
+				if (stop_cond) begin
+					// END=00.  lastbits: 0 if the flushed byte is full.
+					end_seg(has_stop_byte, stop_byte,
+					        {rstart, 2'b00, 2'b00,
+					         stop_full_byte ? 3'd0 : stop_bc[2:0]}, 1'b0);
 					bit_count     <= 3'd0;
 					shift_reg     <= 8'd0;
 					capture_state <= 1'b0;
 
 				end else if (start_cond) begin
-					// Repeated START: flush any partial byte, then mark.  One
-					// byte per clock, so with a partial byte the marker is
-					// deferred one cycle -- same as the original's single
-					// RAM write port forced.
-					if (bit_count != 3'd0) begin
-						out_byte          <= shift_reg << (4'd8 - {1'b0, bit_count});
-						out_stb           <= 1'b1;
-						rpt_start_pending <= 1'b1;
-					end else if (START_MARKER != 0) begin
-						out_byte <= MARKER;
-						out_stb  <= 1'b1;
-					end
+					// Repeated START: END=01 here, RSTART on the next frame.
+					end_seg(bit_count != 3'd0,
+					        shift_reg << (4'd8 - {1'b0, bit_count}),
+					        {rstart, 2'b01, 2'b00, bit_count}, 1'b0);
+					rstart    <= 1'b1;
 					bit_count <= 3'd0;
 					shift_reg <= 8'd0;
 
 				end else if (scl_rising) begin
 					shift_reg <= next_sda;
 					if (bit_count == 3'd7) begin
-						out_byte  <= next_sda;
-						out_stb   <= 1'b1;
 						bit_count <= 3'd0;
+						if (dcount + 9'd2 >= MAXP) begin
+							// Split: this byte, then info END=11, then CLOSE
+							// with CONT for the frame that carries on.
+							end_seg(1'b1, next_sda, {rstart, 2'b11, 2'b00, 3'd0}, 1'b1);
+							rstart <= 1'b0;
+						end else begin
+							emit(`OP_BYTE, next_sda);
+							dcount <= dcount + 9'd1;
+						end
 					end else begin
 						bit_count <= bit_count + 3'd1;
 					end
@@ -190,22 +212,25 @@ endmodule
 
 
 // ====================================================================
-// UART -- the target's TX and RX lines, merged, untagged.
+// UART -- one frame per received byte, or per simultaneous pair.
 //
-// Same receivers and same baud arrangement as uart_to_spi.v: two uart_rx
-// instances from common/uart.v sharing one divide_by_n baud_x4 tick.
-// At 24 MHz, N = 24e6 / (4 * 9600) = 625 gives exactly the 38.4 kHz that
-// uart_to_spi.v gets from 48 MHz / 1250.
+// Payload is one or two [line][byte] pairs, so the frame length says which:
 //
-// Removed: uart_to_spi.v's per-byte [0x48 header][0x01|0x02 direction]
-// framing.  Bytes from both lines are merged in arrival order with no tag,
-// so if BOTH lines carry traffic the MCU cannot tell them apart.  With one
-// line wired (the other idles high and produces nothing) it is unambiguous.
+//   length 2   [line][byte]                  one line had a byte
+//   length 4   [0x01][byte A][0x02][byte B]  both lines had one at once
 //
-// Added: if both receivers finish a byte in the same core clock, the RX
-// byte is held one cycle instead of being lost.  uart_to_spi.v queued both
-// through its own FIFO so it never had this problem; a single-strobe
-// stream output does.
+//   line 0x01 = ch0 / pin 38 (target TX), 0x02 = ch1 / pin 42 (target RX)
+//   -- the values uart_to_spi.v used for its direction byte.  Because the
+//   pairs sit at fixed offsets, a data byte that happens to equal 0x01 or
+//   0x02 can't be mistaken for a line tag.
+//
+// "At once" means both bytes are waiting when the frame starts, i.e. they
+// finished within about a microsecond of each other -- genuinely
+// simultaneous full-duplex traffic, including the same-clock case.  A
+// request on one line followed by a reply on the other is two frames.
+//
+// No idle timeout and no splitting: every frame is complete as soon as the
+// byte (or pair) is.  Receivers and baud tick are uart_to_spi.v's.
 // ====================================================================
 module sbs_uart #(
 	parameter integer CORE_HZ = 24_000_000,
@@ -213,11 +238,14 @@ module sbs_uart #(
 )(
 	input  wire       clk,
 	input  wire       rst,
-	input  wire       line_a,      // target's TX line (uart_to_spi gpio_38)
-	input  wire       line_b,      // target's RX line (uart_to_spi gpio_42)
-	output wire       out_stb,
-	output wire [7:0] out_byte
+	input  wire       line_a,
+	input  wire       line_b,
+	output reg        op_stb,
+	output reg  [1:0] op_kind,
+	output reg  [7:0] op_data
 );
+	localparam [7:0] TAG_A = 8'h01, TAG_B = 8'h02;
+
 	wire baud_x4;
 	divide_by_n #(.N(CORE_HZ / (4 * BAUD))) u_div (clk, rst, baud_x4);
 
@@ -228,31 +256,68 @@ module sbs_uart #(
 	uart_rx u_b (.mclk(clk), .reset(rst), .baud_x4(baud_x4),
 	             .serial(line_b), .data(b_data), .data_strobe(b_stb));
 
-	reg       b_pend   = 1'b0;
-	reg [7:0] b_pend_d = 8'd0;
+	// One holding register per line.  A line can't deliver a second byte
+	// within a character time; a frame takes at most 5 clocks to emit.
+	reg       ha = 1'b0, hb = 1'b0;
+	reg [7:0] ha_d = 8'd0, hb_d = 8'd0;
+
+	// Emission: snapshot what's waiting, then send it one op per clock.
+	reg [2:0]  n_ops = 3'd0;       // ops left in the current frame, incl. CLOSE
+	reg [31:0] seq   = 32'd0;      // pending payload bytes, MSB first
+	reg        take_a, take_b;
+
 	always @(posedge clk) begin
-		if (rst)                   b_pend <= 1'b0;
-		else if (a_stb && b_stb)   begin b_pend <= 1'b1; b_pend_d <= b_data; end
-		else if (b_pend && !a_stb) b_pend <= 1'b0;   // emitted this cycle
+		op_stb <= 1'b0;
+		take_a = 1'b0; take_b = 1'b0;
+
+		if (rst) begin
+			ha <= 1'b0; hb <= 1'b0; n_ops <= 3'd0;
+		end else begin
+			if (n_ops != 3'd0) begin
+				op_stb <= 1'b1;
+				if (n_ops == 3'd1) begin
+					op_kind <= `OP_CLOSE; op_data <= 8'd0;
+				end else begin
+					op_kind <= `OP_BYTE;  op_data <= seq[31:24];
+					seq <= {seq[23:0], 8'h00};
+				end
+				n_ops <= n_ops - 3'd1;
+			end else if (ha && hb) begin
+				seq   <= {TAG_A, ha_d, TAG_B, hb_d};
+				n_ops <= 3'd5;                       // 4 bytes + CLOSE
+				take_a = 1'b1; take_b = 1'b1;
+			end else if (ha) begin
+				seq   <= {TAG_A, ha_d, 16'd0};
+				n_ops <= 3'd3;                       // 2 bytes + CLOSE
+				take_a = 1'b1;
+			end else if (hb) begin
+				seq   <= {TAG_B, hb_d, 16'd0};
+				n_ops <= 3'd3;
+				take_b = 1'b1;
+			end
+
+			// Consume, then capture: a byte arriving this clock is kept.
+			if (take_a) ha <= 1'b0;
+			if (take_b) hb <= 1'b0;
+			if (a_stb) begin ha <= 1'b1; ha_d <= a_data; end
+			if (b_stb) begin hb <= 1'b1; hb_d <= b_data; end
+		end
 	end
-
-	wire b_out = ~a_stb & (b_stb | b_pend);
-
-	assign out_stb  = a_stb | b_out;
-	assign out_byte = a_stb ? a_data : (b_pend ? b_pend_d : b_data);
 endmodule
 
 
 // ====================================================================
-// SPI -- MOSI byte then MISO byte, per 8 SCK edges.
+// SPI -- one frame per CS assertion.  Payload: [mosi][miso] pairs.
 //
-// Wraps ../final_system/sb_decoders.v :: sb_spi, whose shift registers are
-// clocked by the probed SCK (see that module).  Each completed pair is
-// serialized as two stream bytes on consecutive core clocks.  Pairs arrive
-// at most once per 8 SCK periods, so the second byte is always out before
-// the next pair can land.
+// The frame closes a few clocks after CS rises (synchronized into the core
+// domain), so the last pair -- which crosses through its own synchronizer --
+// lands before the CLOSE.  Splits at the last whole pair that fits, with
+// CONT on the next frame.  Bits after the last whole byte are dropped, as
+// in sb_spi.  Not exercised by the testbench.
 // ====================================================================
-module sbs_spi (
+module sbs_spi #(
+	parameter integer MAXP = 255
+)(
 	input  wire       clk,
 	input  wire       rst,
 	input  wire       sck_g,
@@ -260,8 +325,9 @@ module sbs_spi (
 	input  wire       miso,
 	input  wire       cs,
 	input  wire [2:0] spi_mode,
-	output reg        out_stb,
-	output reg  [7:0] out_byte
+	output reg        op_stb,
+	output reg  [1:0] op_kind,
+	output reg  [7:0] op_data
 );
 	wire        p_stb;
 	wire [63:0] p_payload;
@@ -272,47 +338,44 @@ module sbs_spi (
 		.ev_payload(p_payload)
 	);
 
-	reg       second   = 1'b0;
+	reg [2:0] cs_s = 3'b111;
+	always @(posedge clk) cs_s <= {cs_s[1:0], cs};
+	wire cs_rise = cs_s[1] & ~cs_s[2];
+
+	reg [2:0] close_dly = 3'd0;     // counts down to the CS CLOSE
+	reg [1:0] st = 2'd0;            // 0 idle, 1 send MISO, 2 send split CLOSE
 	reg [7:0] miso_hold = 8'd0;
-	always @(posedge clk) begin
-		out_stb <= 1'b0;
-		if (rst) second <= 1'b0;
-		else if (p_stb) begin
-			out_byte  <= p_payload[63:56];   // MOSI
-			out_stb   <= 1'b1;
-			miso_hold <= p_payload[55:48];   // MISO
-			second    <= 1'b1;
-		end else if (second) begin
-			out_byte <= miso_hold;
-			out_stb  <= 1'b1;
-			second   <= 1'b0;
-		end
-	end
-endmodule
+	reg [8:0] plen = 9'd0;
 
-
-// ====================================================================
-// DIO -- one byte per edge: 0x01 after a rising edge, 0x00 after falling.
-//
-// Not tested on hardware or exercised by the testbench.  A fast-toggling
-// input will fill the FIFO; there is no rate limit.
-// ====================================================================
-module sbs_dio (
-	input  wire       clk,
-	input  wire       rst,
-	input  wire       pin,
-	output reg        out_stb,
-	output reg  [7:0] out_byte
-);
-	reg [2:0] s = 3'b000;
 	always @(posedge clk) begin
-		out_stb <= 1'b0;
-		if (rst) s <= {3{pin}};
-		else begin
-			s <= {s[1:0], pin};
-			if (s[1] ^ s[2]) begin
-				out_byte <= {7'd0, s[1]};
-				out_stb  <= 1'b1;
+		op_stb <= 1'b0;
+		if (rst) begin
+			st <= 2'd0; plen <= 9'd0; close_dly <= 3'd0;
+		end else begin
+			if (cs_rise) close_dly <= 3'd4;
+			else if (close_dly > 3'd1) close_dly <= close_dly - 3'd1;
+
+			if (p_stb) begin
+				op_stb <= 1'b1; op_kind <= `OP_BYTE; op_data <= p_payload[63:56];
+				miso_hold <= p_payload[55:48];
+				st <= 2'd1;
+			end else if (st == 2'd1) begin
+				op_stb <= 1'b1; op_kind <= `OP_BYTE; op_data <= miso_hold;
+				if (plen + 9'd4 > MAXP) begin
+					st <= 2'd2;                    // no room for another pair
+				end else begin
+					plen <= plen + 9'd2;
+					st <= 2'd0;
+				end
+			end else if (st == 2'd2) begin
+				op_stb <= 1'b1; op_kind <= `OP_CLOSE; op_data <= 8'd1;
+				plen <= 9'd0; st <= 2'd0;
+			end else if (close_dly == 3'd1) begin
+				close_dly <= 3'd0;
+				if (plen != 9'd0) begin
+					op_stb <= 1'b1; op_kind <= `OP_CLOSE; op_data <= 8'd0;
+				end
+				plen <= 9'd0;
 			end
 		end
 	end
@@ -320,25 +383,78 @@ endmodule
 
 
 // ====================================================================
-// CAN -- can_sniffer.v's 20-byte record, serialized onto the stream.
+// DIO -- one frame per edge.  Payload: [level][timestamp, 4 bytes, BE].
 //
-//   AA | flags | id[4] | {dropped,3'b0,dlc} | data[8] | timestamp[4] | 55
+// level: 0x01 after a rising edge, 0x00 after a falling edge.
+// timestamp: microseconds since reset (or since DIO was selected), wraps
+// after ~71 minutes.  An edge arriving while the previous frame is still
+// being sent (6 clocks) is missed.  Not exercised by the testbench.
+// ====================================================================
+module sbs_dio #(
+	parameter integer CORE_HZ = 24_000_000
+)(
+	input  wire       clk,
+	input  wire       rst,
+	input  wire       pin,
+	output reg        op_stb,
+	output reg  [1:0] op_kind,
+	output reg  [7:0] op_data
+);
+	localparam integer US_DIV = CORE_HZ / 1_000_000;
+
+	reg [4:0]  us_pre = 5'd0;
+	reg [31:0] us     = 32'd0;
+	always @(posedge clk) begin
+		if (rst) begin us_pre <= 0; us <= 0; end
+		else if (us_pre == US_DIV - 1) begin us_pre <= 0; us <= us + 32'd1; end
+		else us_pre <= us_pre + 5'd1;
+	end
+
+	reg [2:0]  s = 3'b000;
+	reg [39:0] rec = 40'd0;
+	reg [2:0]  left = 3'd0;    // bytes still to send, then a CLOSE
+	reg        closing = 1'b0;
+
+	always @(posedge clk) begin
+		op_stb <= 1'b0;
+		if (rst) begin
+			s <= {3{pin}}; left <= 3'd0; closing <= 1'b0;
+		end else begin
+			s <= {s[1:0], pin};
+			if (left != 3'd0) begin
+				op_stb <= 1'b1; op_kind <= `OP_BYTE; op_data <= rec[39:32];
+				rec  <= {rec[31:0], 8'h00};
+				left <= left - 3'd1;
+				if (left == 3'd1) closing <= 1'b1;
+			end else if (closing) begin
+				op_stb <= 1'b1; op_kind <= `OP_CLOSE; op_data <= 8'd0;
+				closing <= 1'b0;
+			end else if (s[1] ^ s[2]) begin
+				rec  <= {7'd0, s[1], us};
+				left <= 3'd5;
+			end
+		end
+	end
+endmodule
+
+
+// ====================================================================
+// CAN -- one frame per CAN frame.  Payload, 18 bytes:
+//
+//   flags | id[4] | dlc | data[8] | timestamp[4]
 //   flags = {ide, rtr, overload, ack_ok, crc_ok, err[2:0]}
 //
-// Same layout as can_sniffer.v so existing tooling still parses it.  Two
-// differences: `dropped` is always 0 (loss happens in the shared FIFO and
-// is shown on the red LED instead), and the timestamp counts BIT TIMES
-// here just as there -- latched on the falling edge of bus_idle.
-//
-// Not tested on hardware in this build.  Runs at brp = 1 so that
-// can_bit_timing's PIPELINE_RESYNC path is valid -- see unified_top.md.
+// can_sniffer.v's 20-byte record without its AA/55 markers, which the
+// frame header now replaces.  Timestamp in bit times, latched at SOF.
+// Fixed at 1 Mbit/s.  Not exercised by the testbench.
 // ====================================================================
 module sbs_can (
 	input  wire       clk,
 	input  wire       rst,
 	input  wire       can_rx,
-	output reg        out_stb,
-	output reg  [7:0] out_byte
+	output reg        op_stb,
+	output reg  [1:0] op_kind,
+	output reg  [7:0] op_data
 );
 	wire smp_tick, smp_bit, bus_idle, bit_tick, f_stb;
 	wire [28:0] f_id; wire [3:0] f_dlc; wire [63:0] f_data;
@@ -361,7 +477,6 @@ module sbs_can (
 		.frame_overload(f_ovl), .frame_err(f_err)
 	);
 
-	// Bit-time timestamp latched at SOF, as can_sniffer.v does.
 	reg [31:0] bit_time = 32'd0, sof_ts = 32'd0;
 	reg        idle_d   = 1'b1;
 	always @(posedge clk) begin
@@ -373,25 +488,27 @@ module sbs_can (
 		end
 	end
 
-	reg [159:0] rec  = 160'd0;
+	reg [143:0] rec  = 144'd0;
 	reg [4:0]   left = 5'd0;
+	reg         closing = 1'b0;
 	always @(posedge clk) begin
-		out_stb <= 1'b0;
-		if (rst) left <= 5'd0;
-		else if (f_stb) begin
-			rec  <= {8'hAA,
-			         f_ide, f_rtr, f_ovl, f_ack_ok, f_crc_ok, f_err,
+		op_stb <= 1'b0;
+		if (rst) begin left <= 5'd0; closing <= 1'b0; end
+		else if (left != 5'd0) begin
+			op_stb <= 1'b1; op_kind <= `OP_BYTE; op_data <= rec[143:136];
+			rec  <= {rec[135:0], 8'h00};
+			left <= left - 5'd1;
+			if (left == 5'd1) closing <= 1'b1;
+		end else if (closing) begin
+			op_stb <= 1'b1; op_kind <= `OP_CLOSE; op_data <= 8'd0;
+			closing <= 1'b0;
+		end else if (f_stb) begin
+			rec  <= {f_ide, f_rtr, f_ovl, f_ack_ok, f_crc_ok, f_err,
 			         3'b000, f_id,
 			         4'b0000, f_dlc,
 			         f_data,
-			         sof_ts,
-			         8'h55};
-			left <= 5'd20;
-		end else if (left != 5'd0) begin
-			out_byte <= rec[159:152];
-			out_stb  <= 1'b1;
-			rec      <= {rec[151:0], 8'h00};
-			left     <= left - 5'd1;
+			         sof_ts};
+			left <= 5'd18;
 		end
 	end
 endmodule

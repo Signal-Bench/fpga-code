@@ -1,13 +1,14 @@
 # Review notes — problems hit and decisions made
 
 Covers both `final_system/` (the full system: trigger, recording, framed records) and
-`stream_system/` (raw streaming only). Written to be reviewed after the fact, so each
+`stream_system/` (streaming only, framed per `stream_system/MCU_FRAME_FORMAT.md`). Written to be reviewed after the fact, so each
 decision says what the alternative was and when to revisit it.
 
 The other documents, for reference:
 - [`../unified_top.md`](../unified_top.md) — the architecture argument, with measurements
 - [`CHANGES.md`](CHANGES.md) — exact audit of what was modified in existing sniffers
 - [`../stream_system/README.md`](../stream_system/README.md) — how to use and test the stream version
+- [`../stream_system/MCU_FRAME_FORMAT.md`](../stream_system/MCU_FRAME_FORMAT.md) — the wire format, for the MCU firmware
 
 **Status of everything here:** simulated, synthesized, placed. **Nothing has been on
 hardware.**
@@ -77,24 +78,37 @@ hardware.**
 
 ## 2. Decisions — `stream_system` only
 
-### 2.1 Raw bytes, no framing (your direction)
-- My first design wrapped every event in an 8-byte header (sync, protocol, flags, length,
-  timestamp). Dropped before it was built, once you said the firmware streams raw.
+### 2.1 Framing: went raw, then framed again (your direction both times)
+- First version: framed, with an 8-byte header and timestamp; dropped before it was built
+  when you said the firmware streams raw.
+- Second version: raw bytes, no framing. Committed as `f0a4385`. It's still in history.
+- **Current:** `53 42 4D | flags/protocol | length | payload`, per your spec. Two fields
+  were added inside your structure rather than beside it: `DROPPED` and `CONT` live in
+  the top bits of the protocol byte, so the header is still magic, protocol, length.
+  Mask with `0x0F` for the protocol id.
 
 ### 2.2 I2C: port `i2c_sniffer.v` rather than reuse `final_system`'s `sb_i2c`
 - **Why:** "raw, including ACKs" is exactly what `i2c_sniffer.v` produces, and it carries
   three hardware-found fixes. `sb_i2c` decodes to byte + ACK flag, and turns out to lack
   all three fixes (see 4.1).
-- **Verified** with `i2c_sniffer_tb.v`'s own driver tasks and its own expected bytes. All
-  three transactions match, including the ACK-jammed-against-STOP case.
-- **Differences, all consequences of streaming rather than buffering:** `0xFF` emitted at
-  START rather than prepended by a drain; an empty START/STOP yields a lone `FF`; an idle
-  timeout can't recall bytes already sent; no 128-byte limit.
+- **Verified** with `i2c_sniffer_tb.v`'s own driver tasks and its own expected bytes.
+- **One frame per START-delimited segment**, with a trailing info byte (how it ended,
+  RSTART, valid bits in the last byte). This replaces `i2c_sniffer.v`'s in-band `0xFF`
+  repeated-START marker, which can't be distinguished from data. Not in your spec; added
+  because without a bit count the packed bitstream's zero padding is indistinguishable
+  from data. The T1 vs T1b tests show it: same bytes `6C 05 80`, but 3 real bits vs 2.
 
-### 2.3 UART: tag removed, both lines merged
-- `uart_to_spi.v` sent `[48][01|02][data]`. Removing the tag is what "raw" asks for, but
-  bytes from the two lines then become indistinguishable. Fine for testing one line.
-- **Revisit if** both directions need capturing at once.
+### 2.3 UART: one frame per byte, or per simultaneous pair (your spec)
+- `[tag][byte]` (length 2) or `[01][a][02][b]` (length 4). Tags `01`/`02`, the values
+  `uart_to_spi.v` used.
+- **Before your spec arrived** I'd built direction *segments* with per-segment counts
+  (`[dir][count][bytes]...`), because "sentinels in the payload" alone is ambiguous: a
+  data byte equal to a sentinel. Your fixed `[tag][byte]` pairs solve that more simply,
+  since position decides, not value. It also removed the need for an idle timeout and for
+  splitting.
+- **"Simultaneous" = the same quarter-bit sample tick** (~26 µs at 9600), not ~1 µs as I
+  first told you. Both receivers share one 4×-baud tick. The testbench pins down both
+  sides: 2 µs apart → one frame, 60 µs apart → two.
 
 ### 2.4 Command protocol copied from your `spi_counter_stream.v`, ready check included
 - Your table lists only the `53 42 4D xx` selects. Your firmware *also* sends the
@@ -109,7 +123,15 @@ hardware.**
 
 ### 2.5 A select flushes the FIFO
 - Matches `spi_counter_stream`'s `mode_switch`. Everything after the ACK belongs to the new
-  protocol. One stale byte can still sit in `SPITXDR` and appear *before* the ACK.
+  protocol. One stale byte can still sit in `SPITXDR` and appear *before* the ACK; the
+  parser skips it.
+
+### 2.5a Frames are published atomically
+- The payload is written into the FIFO past the commit pointer, the header (which needs the
+  final length) is written last into 5 reserved bytes, and only then does the frame become
+  visible. Without this the MCU could read a header and then idle `0xFF`s as its payload.
+- A frame that won't fit is dropped whole, never truncated; the next published frame
+  carries `DROPPED`.
 
 ### 2.6 Shared probe pins
 - ch0 = pin 38 (SCL / UART TX line / CAN / DIO), ch1 = pin 42 (SDA / UART RX line).
@@ -162,6 +184,33 @@ hardware.**
 
 ---
 
+### 3.6 Framing problems (all fixed)
+- **The framer didn't close timing: 17 MHz against 24.** Four 13-bit adds chained in one
+  cycle (`fstart + 5 + wlen − rd`, then compare). Fixed by keeping the write pointer as a
+  register that steps forward, and by making the space check a registered compare with an
+  8-byte margin. Now 29.9–33.3 MHz.
+- **A real data-loss bug found by the overflow test.** The space check
+  `(a_nxt - rd) < (DEPTH - 8)` was evaluated at 32 bits, because the integer on the
+  right sizes the whole expression. Once the write pointer wrapped and the read pointer
+  hadn't, it read as "full" with the FIFO half empty. At 4 KB this would have shown up on
+  hardware as **intermittent frame drops every 8 KB of traffic**. No test at the
+  production size streams 8 KB, so it would have shipped. Found only because I shrank the
+  FIFO to 128 bytes to make overflow testable, then refused to accept a passing test whose
+  count (9 frames) didn't match the arithmetic (17). Fixed with a correctly sized wire.
+- **Testbench bugs that looked like design bugs**, recorded so they're recognised next
+  time: `drain` stopped after one burst without a *completed* frame, but a 260-byte frame
+  spans 9 bursts (the MCU firmware must not make the same mistake, and the format doc says
+  so). `uart_send` was a static task, so two concurrent calls under `fork` shared a loop
+  variable. `before` is a SystemVerilog reserved word under `-g2012`.
+
+### 3.7 The C parser in the format doc is tested, not just written
+- `sbs_parser.c` and the I2C regrouping decoder were compiled with
+  `gcc -std=c99 -Wall -Wextra -pedantic` (clean) and run over a byte-for-byte capture of
+  MISO from simulation (`make sim` with `+dump`). Same 49 frames, 3 mode ACKs and 2 ready
+  ACKs as the testbench's own parser, and the I2C decoder recovers every transaction
+  including the CONT-split one. The C files themselves aren't checked in; the doc embeds
+  them.
+
 ## 4. Open issues — not fixed
 
 ### 4.1 `final_system`'s `sb_i2c` regresses against `i2c_sniffer.v` — **fix before using it**
@@ -175,10 +224,17 @@ hardware.**
 - If both lines finish a byte in the same clock, RX is dropped with no `dropped` flag.
   Fixed in `stream_system`'s `sbs_uart`, not back-ported.
 
-### 4.3 `0xFF` ambiguity in the stream — the biggest one for testing
-- Empty FIFO reads as `0xFF`; so does a real `0xFF`, and so does every I2C START marker.
-  Readable by eye against a known pattern; software can't tell them apart. Options are in
-  the stream README.
+### 4.3 No checksum on frames
+- Framing makes frame *boundaries* reliable; it doesn't detect a flipped bit inside a
+  payload. Your branch's hardware captures saw real one-to-zero MISO errors at some
+  sample-point settings. A 1-byte checksum after the payload would catch most of them.
+  It changes the format, so it's your call. (The earlier `0xFF`-ambiguity issue is solved
+  by framing: idle `0xFF` now only exists between frames.)
+
+### 4.3a Throughput: 7 bytes per UART byte
+- At 64 bytes per 10 ms the firmware reads 6.4 kB/s; a saturated 9600 UART line produces
+  6.7 kB/s of frames. Fine for `send_pattern`, not for continuous traffic. The format doc
+  suggests adaptive polling.
 
 ### 4.4 Stream bytes clocked out during a command are lost
 - If the firmware discards what it receives while sending a command, those bytes are gone.

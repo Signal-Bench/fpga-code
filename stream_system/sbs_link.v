@@ -26,15 +26,15 @@
  * wants to read, and 0x00 can never start a command.
  *
  * Stream semantics -- what the MCU sees on MISO:
- *   - pending ACK bytes first, then FIFO bytes, one per transferred byte
+ *   - pending ACK bytes first, then published frames, byte by byte
  *   - SPITXDR is only loaded when there is something to send.  When there
- *     is not, it goes empty and the master reads 0xFF.  Same policy as
- *     spi_counter_stream.  CONSEQUENCE: a real 0xFF data byte is
- *     indistinguishable from "FIFO empty" -- see README.md.
+ *     is not, it goes empty and the master reads 0xFF -- harmless now that
+ *     frames carry their own length.  See MCU_FRAME_FORMAT.md.
+ *
+ * The FIFO itself lives in sbs_framer.v; this module only reads it.
  */
 module sbs_link #(
-	parameter integer FIFO_AW       = 12,      // 4096 bytes = 8 EBR
-	parameter [2:0]   DEFAULT_PROTO = 3'd0     // I2C after power-up
+	parameter [2:0] DEFAULT_PROTO = 3'd0     // I2C after power-up
 )(
 	input  wire       clk,
 	input  wire       rst,
@@ -45,50 +45,16 @@ module sbs_link #(
 	input  wire       mcu_mosi,
 	output wire       mcu_miso,
 
-	// selected decoder's byte stream
-	input  wire       in_stb,
-	input  wire [7:0] in_byte,
+	// framer read port
+	input  wire [7:0] head,
+	input  wire       empty,
+	output reg        pop,
 
 	output reg  [2:0] proto,
-	output reg        proto_switch,    // 1-clk pulse: hold decoders in reset
-	output wire       overflow,        // 1-clk pulse: a byte was lost, FIFO full
+	output reg        proto_switch,    // 1-clk pulse: flush framer, reset decoders
 	output wire       spi_ready,       // IP configured
 	output reg        tx_pulse         // 1-clk pulse: a byte handed to the IP
 );
-	// ----------------------------------------------------------------
-	// FIFO.  Synchronous read so it infers EBR -- common/util.v's fifo
-	// uses an asynchronous read and builds itself from flops instead.
-	// ----------------------------------------------------------------
-	localparam integer DEPTH = 1 << FIFO_AW;
-
-	reg [7:0]       mem [0:DEPTH-1];
-	reg [FIFO_AW:0] wr_ptr = 0, rd_ptr = 0;
-	reg [7:0]       head   = 8'd0;
-	reg             pop;
-
-	wire [FIFO_AW:0] count = wr_ptr - rd_ptr;
-	wire             empty = (count == 0);
-	wire             full  = (count == DEPTH);
-
-	assign overflow = in_stb & full & ~proto_switch;
-
-	always @(posedge clk) begin
-		if (rst || proto_switch) begin
-			wr_ptr <= 0;
-			rd_ptr <= 0;
-		end else begin
-			if (in_stb && !full) begin
-				mem[wr_ptr[FIFO_AW-1:0]] <= in_byte;
-				wr_ptr <= wr_ptr + 1'b1;
-			end
-			if (pop) rd_ptr <= rd_ptr + 1'b1;
-		end
-		// Registered read.  Settles one clock after rd_ptr moves or after
-		// the byte at rd_ptr is written; the service loop is several clocks
-		// between loads, so the head is always settled when it is used.
-		head <= mem[rd_ptr[FIFO_AW-1:0]];
-	end
-
 	// ----------------------------------------------------------------
 	// SB_SPI register map and configuration -- identical to
 	// spi_counter_stream.v.  A write to any config register resets the SPI

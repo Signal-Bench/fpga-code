@@ -4,3 +4,4 @@
 *.out
 *.vcd
 *.rpt
+miso_dump.txt

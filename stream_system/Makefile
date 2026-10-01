@@ -8,7 +8,7 @@ pnr_freq_mhz = 24
 # CAN from ../can_sniffer (PIPELINE_RESYNC opt-in), sb_spi from ../final_system.
 rtl = ../can_sniffer/can_crc15.v ../can_sniffer/can_bit_timing.v \
       ../can_sniffer/can_frame_fsm.v ../final_system/sb_decoders.v \
-      sbs_decoders.v sbs_link.v
+      sbs_decoders.v sbs_framer.v sbs_link.v
 
 build:
 	yosys -p "synth_ice40 -top $(top_module) -json $(top_module).json" $(rtl) $(top_module).v
@@ -37,6 +37,11 @@ seeds:
 sim:
 	iverilog -g2012 -o $(top_module)_tb.out $(rtl) $(top_module).v $(top_module)_tb.v
 	vvp $(top_module)_tb.out
+
+# Production payload limit, with an I2C transaction long enough to split.
+sim-255:
+	iverilog -g2012 -P signalbench_stream_tb.MAXP=255 -P signalbench_stream_tb.FIFO_AW=12 -o $(top_module)_tb255.out $(rtl) $(top_module).v $(top_module)_tb.v
+	vvp $(top_module)_tb255.out
 
 wave:
 	iverilog -g2012 -o $(top_module)_tb.out $(rtl) $(top_module).v $(top_module)_tb.v
