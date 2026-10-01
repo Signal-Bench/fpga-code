@@ -105,7 +105,8 @@ host_to_fpga/        UART echo + inverted-byte-response demo, used to validate t
 clock_out/           UART RX -> bit-banged SPI TX bridge (earlier/simpler than uart_to_spi)
 clock_test/          minimal design: divides 48 MHz HFOSC down to ~1 MHz on a pin
 spi_hw_stream/       hard-IP (SB_SPI) SLAVE bring-up test — streams a repeating "Hello World!"
-spi_counter_stream/  same design with the ascending-byte-counter payload (stronger link check)
+spi_counter_stream/  same design with a selectable test pattern + mode commands
+spi_replay_stream/   SB_SPI SLAVE that replays a preloaded 4 KB EBR buffer, master-paced
 spi_to_uart/         hard-IP (SB_SPI) SLAVE that prints every MOSI byte to picocom as hex
 spi_slave/           standalone SPI slave register interface, not wired into any top module
 tools/               send_pattern.c — host-side UART test-pattern generator
@@ -303,7 +304,35 @@ icepack <name>.asc <name>.bin
   width is derived from `TICK_DIV` via `$clog2` and the testbench scales its wait
   windows off `dut.TICK_DIV`, so the sim is meaningful at any rate (checked 500 Hz to
   2 MHz). An earlier revision hardcoded that counter at 6 bits, which pinned the usable
-  rate at >= 375 kHz and made edits to `DATA_RATE_HZ` appear to do nothing.
+  rate at >= 375 kHz and made edits to `DATA_RATE_HZ` appear to do nothing. It now
+  carries **two selectable payloads** (ascending printable ASCII, and `"Hello World!"`)
+  chosen by a 4-byte MOSI command — magic `53 42`, mode opcode `4D` + `01`/`02`, ready
+  probe `53 42 A5 5A` — whose ACK arrives in the *following* transaction, since a slave
+  cannot answer a byte it has not received. One prefetched stream byte may precede the
+  ACK, so scan for the magic rather than assuming byte 0.
+
+- **The three SB_SPI slave images differ in one deliberate way: what a full FIFO means.**
+  `spi_hw_stream/` and `spi_counter_stream/` **drop** the new byte — they model a *live
+  bus*, which cannot be told to wait, so the size of the forward skip measures how far
+  behind the master is. That is intentional; do not "fix" it into stalling (it was
+  changed to stalling once on `fix/spi-stream-reliability` and changed back, because
+  stalling makes throughput unmeasurable). The consequence is that a skip alone does not
+  separate "master too slow" from "link lost a byte" — the red LED does. For the lossless
+  case, use `spi_replay_stream/`.
+
+- `spi_replay_stream/` — the **recorded-data** counterpart, and the strictest of the
+  three link tests. 4096 bytes sit in inferred EBR, preloaded from bitstream INIT values
+  (define `REPLAY_HEX_FILE` to replay a real capture instead). There is no producer, no
+  tick divider, no FIFO and no drop path: the replay pointer advances *only* when the
+  hard IP has taken a byte, so the master is the sole flow-control authority and the byte
+  sequence is identical at 100 kHz or 4 MHz. Any gap or repeat is therefore a transport
+  or hard-IP fault with the generator ruled out. Default contents are 16-byte records
+  (`A5 | rec | 13 payload | 5A`), so every 16th byte must be `0xA5`. `REPLAY_LOOP=0`
+  plays once and goes quiet, modelling end-of-recording. 112 LC, 8 of 30 EBR, Fmax
+  48.6 MHz. Its testbench cannot represent SCK above ~4 MHz — the `SB_SPI` stub
+  oversamples SCKI with a 2-flop synchronizer at 24 MHz, so past that the *model*
+  aliases, not the design. Closest existing model of the recording-drain mode in
+  `state_management.md`.
 - `spi_to_uart/` — `spi_hw_stream`'s `SB_SPI` slave with the counter stream replaced by
   the UART TX path from `host_to_fpga`: every byte received on MOSI is printed to the
   host as hex over pin 14 at 1 Mbaud (`make pico`), one line per CS assertion. Same SPI
