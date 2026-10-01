@@ -1,82 +1,51 @@
 # SPI Stream Reliability Changes
 
-## Summary
+## Current Contract
 
-This branch makes the synthetic SPI stream generators preserve a consecutive
-test sequence when their transmit FIFO becomes full. It also expands the
-testbenches and documentation to describe FIFO backpressure accurately.
+Both hard-SPI bring-up images send raw FIFO bytes on MISO whenever the MCU
+asserts CS and supplies SCK:
 
-These changes apply to:
+- `spi_counter_stream`: ascending printable ASCII from space through `~`, then LF.
+- `spi_hw_stream`: repeating `Hello World!`.
 
-- `spi_counter_stream`: selectable ascending ASCII / `Hello World!` stream
-- `spi_hw_stream`: repeating `Hello World!` message
+Neither image decodes commands or inserts headers, counts, ACKs, or markers.
+MOSI is ignored. The counted request/response version was removed because the
+intended architecture keeps the FPGA a raw data source and packages data only
+on the MCU. See [`SPI_RAW_STREAM.md`](SPI_RAW_STREAM.md).
 
-## Problem
+## Retained Reliability Behavior
 
-Both generators previously advanced their source on every sample tick, even
-when the FIFO was full. The full FIFO rejected the new byte, but the source
-continued advancing. Once the buffered data drained, the master observed a
-forward jump that looked exactly like an SPI byte-loss problem.
+The source advances only when its byte is accepted into the FIFO. A full FIFO
+pauses the synthetic source rather than overwriting buffered data or creating
+counter/message gaps. The red LED continues to indicate this backpressure.
+The SPI service loop pops a FIFO byte only when written to the hard-IP TX
+register and drains/discards RX bytes without interpreting them.
 
-This was especially confusing for the counter test, whose purpose is to make
-real missing, repeated, or reordered SPI bytes easy to detect.
+The ESP32 defaults to 2 MHz with its default sample point and one clock of CS
+setup/hold. A phase-1 override previously increased one-to-zero MISO errors.
+It clocks 64 raw bytes every 10 ms, giving 6.4 kB/s of wire capacity for the
+3 kB/s test source. No READ, ready, or mode control transfers are sent, and
+BOOT switching stays disabled.
 
-The iCE40 hard-SPI design also has limited timing margin near 10 MHz when its
-general-fabric pins are used. The companion ESP32 firmware defaults to a 2 MHz
-SPI clock. Hardware captures showed that explicitly selecting the phase-1
-sample point increased one-to-zero MISO errors, so the firmware now retains
-the ESP32-H2 default sample point and restores a one-clock CS setup interval.
-Its polling interval is 10 ms. Length-prefixed 64-byte responses now carry up
-to 58 payload bytes, giving 5.8 kB/s capacity for the 3 kB/s test source.
+## MCU Packaging
 
-## Changes
+The ESP32 preserves every received byte and wraps each read in a full SPI TLV
+frame. It does not filter `00`, `FF`, CR, LF, periods, or header-like sequences.
+A 64-byte raw read produces an 83-byte mobile frame (ATT MTU at least 86).
 
-- Advance `data_counter` only when a counter byte is accepted into the FIFO.
-- Advance `msg_idx` only when a message byte is accepted into the FIFO.
-- Treat a full FIFO as backpressure that pauses the synthetic source.
-- Preserve the red LED indication while the source is stalled.
-- Update both READMEs to distinguish source backpressure from transport loss.
-- Add simulation assertions that the source does not advance while full.
-- Restore the ESP32-H2 default sample point after phase-1 regressed hardware captures.
-- Drain hard-SPI RX before TX refills to prevent command receive overruns.
-- Add command turnaround time and bounded mode-command retries on the MCU.
-- Add ready/mode command decoding and follow-up transaction ACKs.
-- Map SPI mode to ascending printable ASCII and DIO mode to `Hello World!`.
-- Add shared `53 42 52 <maximum>` READ / `53 42 44 <count>` response framing.
-- Snapshot each batch's valid-byte count and pop only its reserved payload.
-- Keep idle `FF` outside the payload without filtering real binary bytes.
-- Make ready commands available in both stream images; mode select remains
-  counter-only. The MCU no longer switches modes with BOOT or at startup.
-
-With this behavior, a counter jump or skipped message character is evidence
-of a transport or hard-SPI issue rather than an intentional generator drop.
+Without a data-ready signal or another agreed boundary, idle `FF` and binary
+`FF` are indistinguishable. ASCII padding dots may remain; filtering them is
+not a lossless solution. No data-ready wiring or error correction is added.
 
 ## Verification
 
-Both behavioral simulations pass with Icarus Verilog:
+Behavioral simulations cover startup reads with no command, source stalling,
+FIFO-full backpressure, byte order across CS boundaries, ASCII wrap, binary
+bytes, idle clocks, and old command patterns on MOSI that must be ignored.
+Both stream images build through Yosys, nextpnr, and icepack. MCU sanitizer
+tests verify raw SPI TLVs and sequence behavior; the ESP-IDF build also passes.
 
-```text
-PASS: all spi_counter_stream tests completed successfully
-PASS: all spi_hw_stream tests completed successfully
-```
-
-The simulations cover normal sequencing, FIFO-full backpressure, source
-stalling, buffered-data integrity, continuity across chip-select toggles,
-empty/short/full packets, maximum request clamping, binary payloads, and
-control ACKs that do not consume FIFO bytes. Both FPGA images also build
-through synthesis, placement/routing at the Makefile's 30 MHz target, and
-bitstream packing. MCU parser sanitizer tests and the ESP-IDF build pass.
-
-## Remaining Limitation
-
-Both stream images decode READ and ready commands. `spi_counter_stream`
-also supports temporary SPI/DIO test-pattern mode commands; `spi_hw_stream`
-ignores mode select. Neither implements I2C/CAN/UART capture selection. See
-[`SPI_PACKET_PROTOCOL.md`](SPI_PACKET_PROTOCOL.md) for the wire contract.
-
-This format is incompatible with old raw-stream MCU readers. There is no CRC
-or retransmission: aborted reads and physical bit errors are not repaired.
-
-The behavioral `SB_SPI` model is not silicon-accurate. Final validation still
-requires programming the matching bitstream/MCU firmware and checking packet
-counts, prefix bytes, and stream continuity on the target board at 2 MHz.
+The behavioral hard-IP model is not silicon accurate. Final validation requires
+programming both devices and checking startup/CS behavior and MISO sampling
+on the target board at 2 MHz. Raw streaming and TLV framing do not repair
+physical bit errors or recover interrupted reads and failed BLE sends.

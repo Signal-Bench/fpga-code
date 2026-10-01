@@ -27,9 +27,8 @@ endmodule
 //   * the SPI side is oversampled in the SBCLKI domain rather than being a
 //     true asynchronous SCK domain
 //   * transmit underrun shifts out 0xFF as a distinctive marker
-//   * no silicon-specific forced dummy byte; the holding register and shifter
-//     still model a prefetched idle FF before command responses. The host
-//     accepts up to two FF prefix bytes, which must be checked on hardware.
+//   * no silicon-specific forced dummy byte. Startup and empty-TX behavior
+//     must be checked on hardware; this model verifies FIFO/FSM sequencing.
 // It models the one behaviour this design depends on: a single-deep transmit
 // holding register (SPITXDR) that feeds the shifter at each byte boundary,
 // with TRDY/RRDY status bits driving the handshake.
@@ -201,32 +200,7 @@ module spi_hw_stream_tb;
 		.led_r(led_r), .led_g(led_g), .led_b(led_b)
 	);
 
-	// One SPI burst: assert CS, clock n bytes MSB-first (mode 0), release CS.
-	reg [7:0] burst [0:63];
-	task spi_wire_read(input integer n);
-		integer i, b;
-		reg [7:0] rx;
-		begin
-			spi_cs = 1'b0;
-			#(HALF);                     // CS setup before the first clock
-			for (i = 0; i < n; i = i + 1) begin
-				rx = 8'h00;
-				for (b = 7; b >= 0; b = b - 1) begin
-					spi_sck = 1'b1;
-					#1;
-					rx[b] = spi_miso;    // master samples on the rising edge
-					#(HALF - 1);
-					spi_sck = 1'b0;
-					#(HALF);
-				end
-				burst[i] = rx;
-			end
-			spi_cs = 1'b1;
-			#(HALF);
-		end
-	endtask
-
-	`include "../common/spi_stream_packet_tb_tasks.vh"
+	`include "../common/spi_raw_stream_tb_tasks.vh"
 
 	// Every byte in the burst must be the next character of the message,
 	// continuing from wherever the stream left off.
@@ -277,9 +251,8 @@ module spi_hw_stream_tb;
 		// that is well short of full (FIFO_DEPTH ticks to fill).
 		// ------------------------------------------------------------
 		#5000;
-		spi_packet_read(58);
-		if (packet_len != 0)
-			$fatal(1, "initial empty queue returned data");
+		spi_burst(16);
+		check_empty_stream(16);
 		#(20 * TICK_NS);   // ~20 characters queued, no drops yet
 
 		if (led_g !== 1'b0) begin
@@ -332,6 +305,7 @@ module spi_hw_stream_tb;
 		$display("  stall window: %0d blocked characters, fifo_count = %0d",
 		         stall_count - stalls_before, dut.fifo_count);
 
+		commands_on_mosi = 1;
 		spi_burst(16);
 		dump_burst(16, "burst 2");
 
@@ -358,7 +332,7 @@ module spi_hw_stream_tb;
 		spi_burst(8);
 		dump_burst(8, "burst 3");
 		check_stream(8, "burst 3");
-		check_packet_edges;
+		check_binary_stream;
 
 		#1000;
 		if (errors == 0)

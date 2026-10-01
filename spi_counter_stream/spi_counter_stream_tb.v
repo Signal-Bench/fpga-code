@@ -27,9 +27,8 @@ endmodule
 //   * the SPI side is oversampled in the SBCLKI domain rather than being a
 //     true asynchronous SCK domain
 //   * transmit underrun shifts out 0xFF as a distinctive marker
-//   * no silicon-specific forced dummy byte; the holding register and shifter
-//     still model a prefetched idle FF before command responses. The host
-//     accepts up to two FF prefix bytes, which must be checked on hardware.
+//   * no silicon-specific forced dummy byte. Startup and empty-TX behavior
+//     must be checked on hardware; this model verifies FIFO/FSM sequencing.
 // It models the one behaviour this design depends on: a single-deep transmit
 // holding register (SPITXDR) that feeds the shifter at each byte boundary,
 // with TRDY/RRDY status bits driving the handshake.
@@ -174,7 +173,6 @@ module spi_counter_stream_tb;
 	integer errors = 0;
 
 	localparam integer HALF = 250;   // ns -> 2 MHz SCK
-	localparam [8*13-1:0] HELLO_LINE = "Hello World!\n";
 
 	// Every wait below is expressed in SAMPLE periods, derived from the DUT's
 	// own TICK_DIV, so changing DATA_RATE_HZ in the design re-times the whole
@@ -194,34 +192,7 @@ module spi_counter_stream_tb;
 		.led_r(led_r), .led_g(led_g), .led_b(led_b)
 	);
 
-	// One SPI burst: assert CS, clock n bytes MSB-first (mode 0), release CS.
-	reg [7:0] burst [0:63];
-	task spi_wire_read(input integer n);
-		integer i, b;
-		reg [7:0] rx;
-		begin
-			spi_cs = 1'b0;
-			#(HALF);                     // CS setup before the first clock
-			for (i = 0; i < n; i = i + 1) begin
-				rx = 8'h00;
-				for (b = 7; b >= 0; b = b - 1) begin
-					spi_mosi = 1'b0;
-					spi_sck = 1'b1;
-					#1;
-					rx[b] = spi_miso;    // master samples on the rising edge
-					#(HALF - 1);
-					spi_sck = 1'b0;
-					#(HALF);
-				end
-				burst[i] = rx;
-			end
-			spi_cs = 1'b1;
-			spi_mosi = 1'b0;
-			#(HALF);
-		end
-	endtask
-
-	`include "../common/spi_stream_packet_tb_tasks.vh"
+	`include "../common/spi_raw_stream_tb_tasks.vh"
 
 	// Every byte in the burst must be exactly one more than the previous.
 	task check_consecutive(input integer n, input [127:0] label);
@@ -239,61 +210,7 @@ module spi_counter_stream_tb;
 		end
 	endtask
 
-	task check_mode_ack(input [7:0] mode, input [127:0] label);
-		integer i;
-		integer found;
-		begin
-			found = 0;
-			for (i = 0; i <= 12; i = i + 1)
-				if (burst[i] === 8'h53 && burst[i+1] === 8'h42 &&
-				    burst[i+2] === 8'h41 && burst[i+3] === mode)
-					found = 1;
-			if (!found) begin
-				$display("FAIL [%0s]: mode ACK 53 42 41 %02x not found", label, mode);
-				errors = errors + 1;
-			end
-		end
-	endtask
 
-	task check_ready_ack;
-		integer i;
-		integer found;
-		begin
-			found = 0;
-			for (i = 0; i <= 12; i = i + 1)
-				if (burst[i] === 8'h53 && burst[i+1] === 8'h42 &&
-				    burst[i+2] === 8'h4F && burst[i+3] === 8'h4B)
-					found = 1;
-			if (!found) begin
-				$display("FAIL: ready ACK 53 42 4f 4b not found");
-				errors = errors + 1;
-			end
-		end
-	endtask
-
-	task check_hello_present(input integer n);
-		integer i, j;
-		integer found;
-		integer line_matches;
-		reg [7:0] expected;
-		begin
-			found = 0;
-			for (i = 0; i <= n - 13; i = i + 1) begin
-				line_matches = 1;
-				for (j = 0; j < 13; j = j + 1) begin
-					expected = HELLO_LINE[8*(12-j) +: 8];
-					if (burst[i+j] !== expected)
-						line_matches = 0;
-				end
-				if (line_matches)
-					found = 1;
-			end
-			if (!found) begin
-				$display("FAIL: Hello World line not found after mode switch");
-				errors = errors + 1;
-			end
-		end
-	endtask
 
 	task check_ascii_sequence(input integer n);
 		integer i;
@@ -360,9 +277,8 @@ module spi_counter_stream_tb;
 		// 64-entry depth, so the source is not stalled yet.
 		// ------------------------------------------------------------
 		#(CFG_NS);
-		spi_packet_read(58);
-		if (packet_len != 0)
-			$fatal(1, "initial empty queue returned data");
+		spi_burst(16);
+		check_empty_stream(16);
 		#(24 * SAMPLE_NS);
 
 		if (led_g !== 1'b0) begin
@@ -418,6 +334,7 @@ module spi_counter_stream_tb;
 		$display("  stall window: %0d blocked samples, fifo_count = %0d",
 		         stall_count - stalls_before, dut.fifo_count);
 
+		commands_on_mosi = 1;
 		spi_burst(16);
 		dump_burst(16, "burst 2");
 
@@ -452,34 +369,13 @@ module spi_counter_stream_tb;
 		dump_burst(8, "burst 3");
 		check_consecutive(8, "burst 3");
 
-		spi_command(8'hA5, 8'h5A);
-		#5000;
-		spi_wire_read(16);
-		dump_burst(16, "ready ACK");
-		check_ready_ack;
-
-		// DIO is temporarily the Hello World test-pattern selector.
-		spi_command(8'h4D, 8'h02);
-		#5000;
-		spi_wire_read(16);
-		dump_burst(16, "hello ACK");
-		check_mode_ack(8'h02, "hello");
-		#(24 * SAMPLE_NS);
-		spi_burst(24);
-		dump_burst(24, "hello stream");
-		check_hello_present(24);
-
-		// SPI selects ascending printable ASCII again.
-		spi_command(8'h4D, 8'h01);
-		#5000;
-		spi_wire_read(16);
-		dump_burst(16, "ASCII ACK");
-		check_mode_ack(8'h01, "ASCII");
-		#(24 * SAMPLE_NS);
-		spi_burst(16);
-		dump_burst(16, "ASCII stream");
-		check_ascii_sequence(16);
-		check_packet_edges;
+		#(dut.FIFO_DEPTH * SAMPLE_NS);
+		spi_burst(58);
+		check_ascii_sequence(58);
+		#(dut.FIFO_DEPTH * SAMPLE_NS);
+		spi_burst(58);
+		check_ascii_sequence(58);
+		check_binary_stream;
 
 		#1000;
 		if (errors == 0)

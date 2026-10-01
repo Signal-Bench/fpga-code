@@ -9,14 +9,12 @@
  * Test payload: the ASCII string "Hello World!" (MSG_LEN = 12 bytes, one
  * character per byte, no terminator), emitted at up to DATA_RATE_HZ and
  * wrapping from '!' back to 'H'. Each character is pushed
- * into a FIFO. Counted packet payloads concatenate into the repeating string:
+ * into a FIFO. The raw stream repeats the string:
  *   48 65 6c 6c 6f 20 57 6f 72 6c 64 21 48 65 ...
  *
- * Packets: 53 42 52 <limit> reserves a FIFO snapshot; the follow-up transfer
- * returns 53 42 44 <count> + data, with at most two idle FF bytes before it.
- * The TX register is kept loaded with idle FF outside responses. Only payload
- * writes pop the FIFO. The ready command is supported; mode select is ignored.
- * See ../SPI_PACKET_PROTOCOL.md for the host contract.
+ * Raw stream: FIFO bytes feed SPITXDR directly, without READ commands,
+ * handshakes, headers, counts, or ACKs. MOSI is ignored. The master supplies
+ * CS/SCK to read data; an empty transmit path shifts idle FF.
  *
  * Producer/consumer rates: the message source produces DATA_RATE_HZ bytes/s,
  * so the master must sustain at least 8 * DATA_RATE_HZ bits/s of SPI clock to
@@ -30,13 +28,11 @@
  *   GREEN: on once the hard SPI IP has been configured
  *   BLUE:  pulses when a payload byte is handed to the IP
  */
-`include "../common/spi_stream_packet.v"
-
 module top (
 	input  wire spi_sck,       // gpio_11 — SCK in from master
 	input  wire spi_cs,        // gpio_19 — CS in from master (active low)
-	input  wire spi_mosi,      // gpio_21 - commands in from master
-	output wire spi_miso,      // gpio_13 - packets and ACKs out to master
+	input  wire spi_mosi,      // gpio_21 - ignored by the raw stream
+	output wire spi_miso,      // gpio_13 - raw FIFO bytes out to master
 	output wire spi_cs_flash,  // pin 16  — hold the onboard flash deselected
 	output wire led_r,
 	output wire led_g,
@@ -115,7 +111,7 @@ module top (
 
 	wire fifo_push = tick & ~fifo_full;
 	wire source_stalled = tick & fifo_full;
-	wire fifo_pop;
+	reg fifo_pop = 0;
 
 	always @(posedge clk_core) begin
 		if (fifo_push) begin
@@ -175,8 +171,8 @@ module top (
 	// Bit5 (SDBRE) is worth knowing about: it turns on Lattice's dummy
 	// byte response, where the slave sends 0xFF until the first SPITXDR
 	// write, then a single 0x00 marker, then real data — giving the master
-	// a deterministic "data starts here" byte to sync on. Keep it off: the
-	// packet protocol uses a header/count and accepts only FF idle prefixes.
+	// a deterministic "data starts here" byte to sync on. Leave it off so
+	// the raw stream contains no additional hardware framing markers.
 	localparam [7:0] CFG_SPICR2 = 8'b0000_0000;
 
 	// SPIBR (Table 12.5): DIVIDER must be >= 1 per the datasheet.  Only
@@ -219,7 +215,7 @@ module top (
 
 	// ----------------------------------------------------------------
 	// Service state machine: configure the IP, then keep its transmit
-	// register fed with packet bytes or idle FF and drain its RX register so the
+	// register fed from the FIFO and drain its RX register so the
 	// overrun flag never latches up.
 	//
 	// Refill deadline (FPGA-TN-02011 Table 12.8): as a slave, SPITXDR must
@@ -240,18 +236,10 @@ module top (
 
 	reg [3:0] state = S_CR0;
 	wire      spi_ready = (state >= S_POLL);
-	wire [7:0] packet_tx_byte;
-
-	spi_stream_packet u_packet (
-		.clk(clk_core),
-		.rx_valid(state == S_DRAIN_RX && spi_ack), .rx_byte(spi_dato),
-		.tx_accept(state == S_LOAD_TX && spi_ack), .tx_byte(packet_tx_byte),
-		.fifo_count(fifo_count), .fifo_head(fifo_head), .fifo_pop(fifo_pop),
-		.mode_switch(), .mode()
-	);
 
 	always @(posedge clk_core) begin
 		spi_stb  <= 1'b0;
+		fifo_pop <= 1'b0;
 
 		case (state)
 			// -- configuration writes --
@@ -289,7 +277,7 @@ module top (
 					spi_stb <= 1'b0;
 					if (spi_dato[SR_RRDY])
 						state <= S_DRAIN_RX;
-					else if (spi_dato[SR_TRDY])
+					else if (spi_dato[SR_TRDY] && !fifo_empty)
 						state <= S_LOAD_TX;
 					else
 						state <= S_POLL;
@@ -297,10 +285,11 @@ module top (
 			end
 
 			S_LOAD_TX: begin
-				spi_adr <= ADDR_SPITXDR; spi_dati <= packet_tx_byte;
+				spi_adr <= ADDR_SPITXDR; spi_dati <= fifo_head;
 				spi_stb <= 1'b1; spi_rw <= 1'b1;
 				if (spi_ack) begin
 					spi_stb  <= 1'b0;
+					fifo_pop <= 1'b1;
 					state    <= S_POLL;
 				end
 			end

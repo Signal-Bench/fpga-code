@@ -6,14 +6,11 @@
  * and CS.  This is the opposite role from uart_to_spi.v, which bit-bangs a
  * soft SPI master out of fabric.
  *
- * Test payload: ascending printable ASCII (space through '~', then LF) or
- * "Hello World!" followed by LF. SPI mode-select commands switch between the
- * two patterns and receive a four-byte acknowledgement on the next transfer.
+ * Test payload: ascending printable ASCII (space through '~', then LF).
  *
- * Packets: 53 42 52 <limit> reserves a FIFO snapshot; the follow-up transfer
- * returns 53 42 44 <count> + data, with at most two idle FF bytes before it.
- * The TX register is kept loaded with idle FF outside responses. Only payload
- * writes pop the FIFO. See ../SPI_PACKET_PROTOCOL.md for the host contract.
+ * Raw stream: FIFO bytes feed SPITXDR directly, without READ commands,
+ * handshakes, headers, counts, or ACKs. MOSI is ignored. The master supplies
+ * CS/SCK to read data; an empty transmit path shifts idle FF.
  *
  * Producer/consumer rates: the source produces DATA_RATE_HZ bytes/s, so the
  * master must sustain at least 8 * DATA_RATE_HZ bits/s of SPI clock to keep
@@ -27,13 +24,11 @@
  *   GREEN: on once the hard SPI IP has been configured
  *   BLUE:  pulses when a payload byte is handed to the IP
  */
-`include "../common/spi_stream_packet.v"
-
 module top (
 	input  wire spi_sck,       // gpio_11 — SCK in from master
 	input  wire spi_cs,        // gpio_19 — CS in from master (active low)
-	input  wire spi_mosi,      // gpio_21 — commands in from master
-	output wire spi_miso,      // gpio_13 — MISO out to master (test stream / ACK)
+	input  wire spi_mosi,      // gpio_21 - ignored by the raw stream
+	output wire spi_miso,      // gpio_13 - raw FIFO bytes out to master
 	output wire spi_cs_flash,  // pin 16  — hold the onboard flash deselected
 	output wire led_r,
 	output wire led_g,
@@ -75,7 +70,7 @@ module top (
 		tick_ctr <= tick ? {TICK_W{1'b0}} : tick_ctr + 1'b1;
 
 	// ----------------------------------------------------------------
-	// Selectable test-pattern source
+	// Ascending ASCII source
 	//
 	// Register-based with a combinational read of the head, deliberately
 	// NOT an inferred EBR: the read-during-write hazard of a synchronous
@@ -87,16 +82,7 @@ module top (
 	localparam integer FIFO_AW    = 6;
 	localparam integer FIFO_DEPTH = 1 << FIFO_AW;   // 64
 
-	localparam integer          MSG_LEN = 13;
-	localparam [8*MSG_LEN-1:0]  MSG     = "Hello World!\n";
-	localparam integer          MSG_IW  = $clog2(MSG_LEN);
-
-	wire [7:0]                 packet_mode;
-	wire                       mode_hello = (packet_mode == 8'h02);
-	reg  [7:0]                 ascii_char = 8'h20;
-	reg  [MSG_IW-1:0]          msg_idx = 0;
-	wire [7:0]                 msg_byte = MSG[8*(MSG_LEN-1-msg_idx) +: 8];
-	wire [7:0]                 source_byte = mode_hello ? msg_byte : ascii_char;
+	reg [7:0] ascii_char = 8'h20;
 
 	reg  [7:0]         fifo_mem [0:FIFO_DEPTH-1];
 	reg  [FIFO_AW-1:0] fifo_wr    = 0;
@@ -107,41 +93,28 @@ module top (
 	wire       fifo_empty = (fifo_count == 0);
 	wire [7:0] fifo_head  = fifo_mem[fifo_rd];
 
-	wire mode_switch;
-	wire fifo_push = tick & ~fifo_full & ~mode_switch;
+	wire fifo_push = tick & ~fifo_full;
 	wire source_stalled = tick & fifo_full;
-	wire fifo_pop;
+	reg fifo_pop = 0;
 
 	always @(posedge clk_core) begin
-		if (mode_switch) begin
-			fifo_wr    <= 0;
-			fifo_rd    <= 0;
-			fifo_count <= 0;
-			ascii_char <= 8'h20;
-			msg_idx    <= 0;
-		end else begin
-			if (fifo_push) begin
-				fifo_mem[fifo_wr] <= source_byte;
-				fifo_wr           <= fifo_wr + 1'b1;
-				if (mode_hello)
-					msg_idx <= (msg_idx == MSG_LEN - 1) ? {MSG_IW{1'b0}} : msg_idx + 1'b1;
-				else if (ascii_char == 8'h7E)
-					ascii_char <= 8'h0A;
-				else if (ascii_char == 8'h0A)
-					ascii_char <= 8'h20;
-				else
-					ascii_char <= ascii_char + 1'b1;
-			end
-
-			if (fifo_pop)
-				fifo_rd <= fifo_rd + 1'b1;
-
-			case ({fifo_push, fifo_pop})
-				2'b10:   fifo_count <= fifo_count + 1'b1;
-				2'b01:   fifo_count <= fifo_count - 1'b1;
-				default: fifo_count <= fifo_count;
-			endcase
+		if (fifo_push) begin
+			fifo_mem[fifo_wr] <= ascii_char;
+			fifo_wr <= fifo_wr + 1'b1;
+			if (ascii_char == 8'h7E)
+				ascii_char <= 8'h0A;
+			else if (ascii_char == 8'h0A)
+				ascii_char <= 8'h20;
+			else
+				ascii_char <= ascii_char + 1'b1;
 		end
+		if (fifo_pop)
+			fifo_rd <= fifo_rd + 1'b1;
+		case ({fifo_push, fifo_pop})
+			2'b10:   fifo_count <= fifo_count + 1'b1;
+			2'b01:   fifo_count <= fifo_count - 1'b1;
+			default: fifo_count <= fifo_count;
+		endcase
 	end
 
 	// ----------------------------------------------------------------
@@ -184,8 +157,8 @@ module top (
 	// Bit5 (SDBRE) is worth knowing about: it turns on Lattice's dummy
 	// byte response, where the slave sends 0xFF until the first SPITXDR
 	// write, then a single 0x00 marker, then real data — giving the master
-	// a deterministic "data starts here" byte to sync on. Keep it off: the
-	// packet protocol uses a header/count and accepts only FF idle prefixes.
+	// a deterministic "data starts here" byte to sync on. Leave it off so
+	// the raw stream contains no additional hardware framing markers.
 	localparam [7:0] CFG_SPICR2 = 8'b0000_0000;
 
 	// SPIBR (Table 12.5): DIVIDER must be >= 1 per the datasheet.  Only
@@ -226,11 +199,9 @@ module top (
 	// and declare spi_miso as inout.
 	assign spi_miso = so_data;
 
-	wire [7:0] packet_tx_byte;
-
 	// ----------------------------------------------------------------
 	// Service state machine: configure the IP, then keep its transmit
-	// register fed with packet bytes or idle FF and drain its RX register so the
+	// register fed from the FIFO and drain its RX register so the
 	// overrun flag never latches up.
 	//
 	// Refill deadline (FPGA-TN-02011 Table 12.8): as a slave, SPITXDR must
@@ -252,16 +223,9 @@ module top (
 	reg [3:0] state = S_CR0;
 	wire      spi_ready = (state >= S_POLL);
 
-	spi_stream_packet #(.ENABLE_MODE_SELECT(1)) u_packet (
-		.clk(clk_core),
-		.rx_valid(state == S_DRAIN_RX && spi_ack), .rx_byte(spi_dato),
-		.tx_accept(state == S_LOAD_TX && spi_ack), .tx_byte(packet_tx_byte),
-		.fifo_count(fifo_count), .fifo_head(fifo_head), .fifo_pop(fifo_pop),
-		.mode_switch(mode_switch), .mode(packet_mode)
-	);
-
 	always @(posedge clk_core) begin
 		spi_stb  <= 1'b0;
+		fifo_pop <= 1'b0;
 
 		case (state)
 			// -- configuration writes --
@@ -297,12 +261,10 @@ module top (
 				spi_stb <= 1'b1; spi_rw <= 1'b0;
 				if (spi_ack) begin
 					spi_stb <= 1'b0;
-					// Drain incoming command bytes first. Prioritizing TRDY here
-					// can leave SPIRXDR occupied until the following byte arrives,
-					// setting ROE and losing MOSI bytes on real silicon.
+					// Discard MOSI bytes to keep the hard-IP RX register clear.
 					if (spi_dato[SR_RRDY])
 						state <= S_DRAIN_RX;
-					else if (spi_dato[SR_TRDY])
+					else if (spi_dato[SR_TRDY] && !fifo_empty)
 						state <= S_LOAD_TX;
 					else
 						state <= S_POLL;
@@ -311,10 +273,11 @@ module top (
 
 			S_LOAD_TX: begin
 				spi_adr <= ADDR_SPITXDR;
-				spi_dati <= packet_tx_byte;
+				spi_dati <= fifo_head;
 				spi_stb <= 1'b1; spi_rw <= 1'b1;
 				if (spi_ack) begin
 					spi_stb <= 1'b0;
+					fifo_pop <= 1'b1;
 					state <= S_POLL;
 				end
 			end
