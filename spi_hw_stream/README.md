@@ -1,71 +1,58 @@
 # spi_hw_stream - Raw SPI Stream
 
-An iCE40 UP5K/UPduino v3 hard-SPI (`SB_SPI`) slave bring-up image.
-The fixed source repeats "Hello World!" (12 bytes, no terminator).
-Bytes are produced at up to 3 kHz into a 64-entry FIFO. FIFO-full backpressure
-pauses the synthetic source without advancing or overwriting queued data.
+An iCE40 UP5K/UPduino v3 fabric SPI slave image. The directory name is retained
+for compatibility; this image no longer instantiates the hard SPI block.
 
-## Raw Transfers
+The source repeats the 12-byte ASCII string `Hello World!` without a terminator.
+Bytes are produced at up to 3 kHz into a 64-entry FIFO. A full FIFO pauses
+the synthetic source without advancing or overwriting queued data.
 
-The master asserts CS and supplies mode-0, MSB-first SPI clocks. FIFO bytes
-feed the hard-IP TX register directly and appear on MISO without READ commands,
-ready handshakes, mode select, ACKs, headers, or valid-byte counts. MOSI is
-ignored; the service loop drains received bytes only to keep the RX register
-clear. The FPGA cannot shift data without master clocks.
+## Wire Contract
 
-For example: `48 65 6C 6C 6F 20 57 6F 72 6C 64 21 48 65 ...`.
-To use the other pattern, program the `spi_counter_stream` image instead;
-there is no runtime switching or FIFO reset command.
+The master asserts CS and supplies mode-0, MSB-first clocks. Raw bytes appear
+on MISO with no commands, handshake, headers, counts, ACKs, or markers. MOSI
+is ignored. The ESP32 alone constructs the mobile TLVs; see
+[`SPI_RAW_STREAM.md`](../SPI_RAW_STREAM.md).
 
-The ESP32 alone wraps raw reads in complete mobile SPI TLV frames. See
-[`SPI_RAW_STREAM.md`](../SPI_RAW_STREAM.md) for the wire/MCU contract.
+Both images use [`spi_raw_tx.v`](../common/spi_raw_tx.v). It synchronizes SCK
+and CS into the 24 MHz core clock, latches a byte at CS assertion or the
+falling edge following a completed byte, and pops the FIFO only at the eighth
+rising sampling edge. A byte interrupted by CS stays queued and restarts
+from its MSB on the next transfer. A completed byte is committed even when
+CS rises before the final falling edge. Preloading the next byte consumes
+nothing, so repeated short transactions preserve the stream.
 
-## Wiring
+An empty byte is exactly `FF`. Data arriving during that byte waits until
+the next boundary and cannot splice into the idle shifter. Binary `FF`
+is also valid data; the MCU preserves all bytes unchanged.
 
-| Signal | FPGA Pin | Direction | Meaning |
-| --- | --- | --- | --- |
-| SCK | 11 | In | Master clock |
-| CS | 19 | In | Active low |
-| MOSI | 21 | In | Ignored |
-| MISO | 13 | Out | Raw FIFO data |
-| Flash CS | 16 | Out | Held high to deselect onboard flash |
+## Wiring And Timing
 
-These use general-fabric pins, not dedicated configuration-SPI pads.
-Start at 1-2 MHz to allow routing and hard-IP refill margin. The companion
-ESP32 retains its default sample point and one clock of CS setup/hold; a
-phase-1 override regressed previous hardware captures.
+| Signal | FPGA Pin | Direction |
+| --- | --- | --- |
+| SCK | 11 | In |
+| CS | 19 | In, active low |
+| MOSI | 21 | In, ignored |
+| MISO | 13 | Out |
+| Flash CS | 16 | Out, held high |
 
-## Rates And Idle
+Use 1 MHz initially; 2 MHz is the maximum supported SCK with the 24 MHz core.
+Each SCK high/low period must be at least six core clocks; CS setup, hold,
+and high time must each be at least four core clocks (167 ns nominal).
+The ESP32 default uses two SCK clocks of CS setup/hold and retains its
+normal MISO sample point. Pin assignments are unchanged.
 
-The source produces up to 3 kB/s. The MCU must clock at least 24 kbit/s of
-data plus margin for gaps. The default 64 bytes every 10 ms gives 6.4 kB/s
-of wire capacity. A full FIFO pauses the test generator; it does not model
-a real-time capture engine that cannot pause.
-
-An empty hard-IP TX path may shift idle `FF`. The raw wire provides no
-valid-byte count, so the MCU preserves those bytes along with legitimate
-binary `FF`. Repeated dots in an ASCII view are not literal period bytes.
-No byte filtering or data-ready wiring is added.
+The source produces up to 3 kB/s. Reading 64 bytes every 10 ms provides
+6.4 kB/s of wire capacity, so idle FF padding is expected. The generator
+can pause under backpressure; a real capture engine may need more buffering.
 
 ## LEDs
 
 | LED (Active Low) | Meaning |
 | --- | --- |
-| Green | Hard SPI IP configured |
-| Blue | FIFO byte handed to the SPI IP |
+| Green | Stream image running |
+| Blue | A complete FIFO byte sampled by the master |
 | Red | Synthetic source stalled by a full FIFO |
-
-## Register Configuration
-
-| Register | Setting |
-| --- | --- |
-| SPICR1 | `80`: SPI enabled, TXEDGE clear |
-| SPICR2 | `00`: slave, mode 0, MSB first, SDBRE disabled |
-| SPIBR | `01`: valid divider (clock supplied by master) |
-| SPISR | TRDY bit 4, RRDY bit 3 |
-
-Registers are configured once before streaming. SDBRE remains off to avoid
-inserting its optional hardware framing marker.
 
 ## Build And Verification
 
@@ -75,19 +62,17 @@ make build
 make flash
 ```
 
-`make flash` programs over the FTDI device in the existing Makefile.
-Simulation checks raw output without commands, FIFO stalls, continuity across
-CS changes, binary bytes, idle reads, and ignored command patterns on MOSI.
-It cross-checks the message independently of the DUT.
+`make flash` programs the FTDI device configured in the Makefile. Simulation
+runs the actual fabric transmitter, with only the oscillator modeled. It
+checks source backpressure and pattern continuity, all 256 binary values,
+idle bytes, MOSI command patterns, partial CS transfers after each bit,
+CS rising after the last sample edge, late data after underflow, repeated
+one-byte transfers, and sustained 64-byte polling.
 
-To model the risky silicon behavior where the hard SPI block does not preserve
-a preloaded transmit shifter across CS assertions, run the compiled testbench
-with `+drop_preloaded_on_cs`. A failure there means raw payload bytes can be
-lost at transaction boundaries unless the stream is framed or the SPI slave is
-implemented outside the hard IP.
+Run the compiled testbench with `+half=500 +phase=17` for 1 MHz with a phase
+offset, or `+half=250 +phase=37` for 2 MHz. The old
+`+drop_preloaded_on_cs` hard-IP model option has been removed.
 
-The behavioral hard-IP model is not silicon accurate. Confirm the first byte
-at startup, empty-TX dummy behavior, CS boundaries, and sampling on hardware
-at 2 MHz. This change does not correct electrical bit errors or recover
-interrupted transfers. Program matching rebuilt FPGA and ESP32 firmware to
-replace the counted request/response version.
+Program the rebuilt FPGA bitstream and ESP32 firmware before capturing again.
+Simulation and timing closure verify the logic; the target board still needs
+a fresh capture to confirm MISO electrical timing and signal integrity.

@@ -1,51 +1,59 @@
 # SPI Stream Reliability Changes
 
-## Current Contract
+## Raw Contract
 
-Both hard-SPI bring-up images send raw FIFO bytes on MISO whenever the MCU
-asserts CS and supplies SCK:
+Both FPGA images remain raw mode-0, MSB-first data sources: printable ASCII
+plus LF in `spi_counter_stream`, and `Hello World!` in `spi_hw_stream`.
+MOSI is ignored. The MCU alone adds SignalBench TLVs, with no FPGA commands,
+headers, counts, ACKs, or new data-ready wiring. See
+[`SPI_RAW_STREAM.md`](SPI_RAW_STREAM.md).
 
-- `spi_counter_stream`: ascending printable ASCII from space through `~`, then LF.
-- `spi_hw_stream`: repeating `Hello World!`.
+## FPGA Transmitter
 
-Neither image decodes commands or inserts headers, counts, ACKs, or markers.
-MOSI is ignored. The counted request/response version was removed because the
-intended architecture keeps the FPGA a raw data source and packages data only
-on the MCU. See [`SPI_RAW_STREAM.md`](SPI_RAW_STREAM.md).
+The hard-IP register feeder is replaced by the shared fabric transmitter in
+[`common/spi_raw_tx.v`](common/spi_raw_tx.v). The old tests assumed hard-IP
+underflow and preloaded-byte behavior that they could not verify on silicon.
+The new implementation makes those boundaries explicit:
 
-## Retained Reliability Behavior
+- Load a byte at CS assertion or the falling edge after a complete byte.
+- Pop the FIFO only at the eighth rising sampling edge.
+- Keep a partial byte queued when CS interrupts a transfer.
+- Consume nothing when preloading the next byte before CS rises.
+- Complete an idle FF byte before accepting data that arrives during it.
 
-The source advances only when its byte is accepted into the FIFO. A full FIFO
-pauses the synthetic source rather than overwriting buffered data or creating
-counter/message gaps. The red LED continues to indicate this backpressure.
-The SPI service loop pops a FIFO byte only when written to the hard-IP TX
-register and drains/discards RX bytes without interpreting them.
+All logic runs in the 24 MHz core domain with synchronized SCK and CS. SCK
+is limited to 2 MHz, with CS setup/hold/high times of at least four core
+clocks. FIFO-full backpressure still pauses the source without advancing
+its pattern. Blue now indicates a complete payload byte clocked out; green
+indicates the stream is running; red still indicates source backpressure.
 
-The ESP32 defaults to 2 MHz with its default sample point and one clock of CS
-setup/hold. A phase-1 override previously increased one-to-zero MISO errors.
-It clocks 64 raw bytes every 10 ms, giving 6.4 kB/s of wire capacity for the
-3 kB/s test source. No READ, ready, or mode control transfers are sent, and
-BOOT switching stays disabled.
+## ESP32 And TLVs
 
-## MCU Packaging
+The default SCK is 1 MHz with the normal MISO sample point and two clocks of
+CS setup/hold. Reads remain 64 bytes every 10 ms. The MCU preserves every
+raw byte, including FF padding and binary values, in a complete 83-byte
+SPI TLV frame. The app still needs notifications and ATT MTU at least 86.
 
-The ESP32 preserves every received byte and wraps each read in a full SPI TLV
-frame. It does not filter `00`, `FF`, CR, LF, periods, or header-like sequences.
-A 64-byte raw read produces an 83-byte mobile frame (ATT MTU at least 86).
+Output readiness now checks the required SPI MTU, and connection events reset
+MTU and congestion state. A rejected BLE enqueue retains the read and retries
+an identical frame and sequence before reading again. The polling schedule
+resets after pauses/errors instead of issuing rapid catch-up reads. Unready
+reads are still drained, with an explicit `skipped` diagnostic counter.
 
-Without a data-ready signal or another agreed boundary, idle `FF` and binary
-`FF` are indistinguishable. ASCII padding dots may remain; filtering them is
-not a lossless solution. No data-ready wiring or error correction is added.
+This retries enqueue failures; it does not acknowledge delivery at the phone,
+correct electrical errors, or buffer data across disconnects. Idle FF and
+binary FF remain indistinguishable without an agreed validity signal.
 
 ## Verification
 
-Behavioral simulations cover startup reads with no command, source stalling,
-FIFO-full backpressure, byte order across CS boundaries, ASCII wrap, binary
-bytes, idle clocks, and old command patterns on MOSI that must be ignored.
-Both stream images build through Yosys, nextpnr, and icepack. MCU sanitizer
-tests verify raw SPI TLVs and sequence behavior; the ESP-IDF build also passes.
+Both bitstreams build through Yosys, nextpnr, and icepack with timing checks.
+The actual transmitter RTL is exercised at 1 MHz and 2 MHz with phase offsets.
+Tests cover source stalls and wraps, all 256 byte values, partial transfers
+after each bit, CS after the last sampling edge, late data after underflow,
+repeated one-byte CS transactions, and sustained 64-byte polling.
 
-The behavioral hard-IP model is not silicon accurate. Final validation requires
-programming both devices and checking startup/CS behavior and MISO sampling
-on the target board at 2 MHz. Raw streaming and TLV framing do not repair
-physical bit errors or recover interrupted reads and failed BLE sends.
+Sanitizer-enabled MCU tests exercise the production SPI packager, binary byte
+preservation, frame limits, invalid TLVs, sequence wrap, disconnected output,
+and byte-for-byte identical retries. Run `idf.py build` for the ESP32 firmware.
+Program both rebuilt devices and take a fresh capture to validate the physical
+link and the complete phone delivery path.

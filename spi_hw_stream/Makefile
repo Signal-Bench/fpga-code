@@ -3,18 +3,19 @@ top_module = top
 pcf_file = $(filename).pcf
 tb = $(filename)_tb
 pnr_freq_mhz = 30
+rtl = $(filename).v ../common/spi_raw_tx.v
 
 build:
-	yosys -p "synth_ice40 -top $(top_module) -json $(filename).json" $(filename).v
+	yosys -p "synth_ice40 -top $(top_module) -json $(filename).json" $(rtl)
 	nextpnr-ice40 --up5k --package sg48 --json $(filename).json --pcf $(pcf_file) --asc $(filename).asc --freq $(pnr_freq_mhz)
 	icepack $(filename).asc $(filename).bin
 
 sim:
-	iverilog -g2012 -o $(tb).out $(filename).v $(tb).v
+	iverilog -g2012 -o $(tb).out $(rtl) $(tb).v
 	vvp $(tb).out
 
 wave:
-	iverilog -g2012 -o $(tb).out $(filename).v $(tb).v
+	iverilog -g2012 -o $(tb).out $(rtl) $(tb).v
 	vvp $(tb).out +vcd
 	gtkwave $(tb).vcd
 
