@@ -30,3 +30,6 @@ docs/
 
 # Editor / agent scratch
 .codex
+
+# spi_frame_stream test vectors (make vectors); copied into the MCU repo
+frames.txt

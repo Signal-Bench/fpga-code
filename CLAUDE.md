@@ -107,6 +107,7 @@ clock_test/          minimal design: divides 48 MHz HFOSC down to ~1 MHz on a pi
 spi_hw_stream/       hard-IP (SB_SPI) SLAVE bring-up test — streams a repeating "Hello World!"
 spi_counter_stream/  same design with the ascending-byte-counter payload (stronger link check)
 spi_to_uart/         hard-IP (SB_SPI) SLAVE that prints every MOSI byte to picocom as hex
+spi_frame_stream/    framed, acknowledged, lossless 1 Mbps stream to the ESP32-H2 (soft SPI slave, SPRAM buffer)
 spi_slave/           standalone SPI slave register interface, not wired into any top module
 tools/               send_pattern.c — host-side UART test-pattern generator
 ice40_ultraplus_examples/   vendored example collection (own Makefiles/README)
@@ -309,6 +310,22 @@ icepack <name>.asc <name>.bin
   host as hex over pin 14 at 1 Mbaud (`make pico`), one line per CS assertion. Same SPI
   pins as `spi_hw_stream`, receive-only (MISO carries nothing). Simulation-verified
   only; has its own `README.md` with wiring, output format, and throughput limits.
+- `spi_frame_stream/` — the FPGA → MCU data link meant to replace the raw streams above.
+  A fake sensor (62.5 k 16-bit samples/s = **1 Mbps**) fills a 128 KB SPRAM ring (all
+  four `SB_SPRAM256KA`); the ESP32-H2 drains it one **framed** transfer per CS
+  assertion — sync, start offset, sample count, drop counter, status, samples,
+  CRC-16. The MCU sends a CRC-protected control block on MOSI at the start of every
+  read carrying an **ack** (next sample offset it needs), and the FPGA frees data
+  only on that ack, so corrupted, aborted or missed reads cost a resend, never data;
+  the only loss is buffer-full drops, which are counted. The SPI slave is **fabric
+  logic, not `SB_SPI`**, so frames restart cleanly at every CS fall and the sim is
+  exact — the cost is a ~3 MHz SCK ceiling (oversampled at 24 MHz), ~2x the 1 Mbps
+  target at 2 MHz. Its `README.md` is the canonical protocol spec; the MCU parser in
+  the Microcontroller repo (`main/fpga_spi_live/`) must match it, and `make vectors`
+  regenerates the frame captures the MCU host test replays. The SPI and frame logic
+  are pipelined for timing (`DEC_*` decision stages, `P1`–`P3` byte prep with a
+  `prep_age` stale-data guard) — read the comments before touching them; a naive
+  single-cycle version closed at 18 MHz.
 - `spi_slave/` — a fuller-featured **soft** SPI slave register interface (separate read/write queues); not currently wired into any `top` module in this repo, and has no Makefile of its own.
 - `common/uart.v` / `common/util.v` — shared building blocks (`uart_tx`/`uart_rx`, `divide_by_n`, `fifo`, `pulse_stretcher`, etc.), pulled in via `` `include "../common/..." `` by nearly every design above.
 

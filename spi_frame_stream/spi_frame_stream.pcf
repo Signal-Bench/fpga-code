@@ -1,0 +1,17 @@
+# spi_frame_stream pinout for UPduino v3
+#
+# Same physical pins as spi_hw_stream, so the bench wiring does not change.
+# The SPI slave here is plain fabric logic, not the SB_SPI hard IP, so these
+# are ordinary I/O: SCK, CS and MOSI are inputs from the ESP32-H2 (master),
+# MISO is the only output.  Pin 16 holds the onboard flash deselected.
+
+set_io -nowarn led_r        41
+set_io -nowarn led_g        39
+set_io -nowarn led_b        40
+
+set_io -nowarn spi_cs_flash 16
+
+set_io -nowarn spi_sck      11
+set_io -nowarn spi_cs       19
+set_io -nowarn spi_mosi     21
+set_io -nowarn spi_miso     13
