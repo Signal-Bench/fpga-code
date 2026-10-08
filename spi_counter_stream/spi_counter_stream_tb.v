@@ -52,6 +52,7 @@ module SB_SPI (
 	reg       rx_full = 0;
 	reg [7:0] shifter = 8'hFF;
 	reg       shifter_valid = 0;   // shifter holds a byte that has not been sent yet
+	reg       drop_preloaded_on_cs = 0;
 	reg [7:0] rx_shift = 0;
 	reg [2:0] bit_idx = 0;
 	reg [7:0] dato_r = 0;
@@ -81,9 +82,11 @@ module SB_SPI (
 	// real IP behaves this way is one of the things this test is meant to
 	// find out on hardware — see the README.)
 	wire eng_byte_done = spe && cs_low && sck_fall && (bit_idx == 3'd7);
-	wire eng_cs_start  = spe && cs_fall && !shifter_valid;
+	wire eng_cs_start  = spe && cs_fall && (!shifter_valid || drop_preloaded_on_cs);
 	wire eng_load      = eng_byte_done || eng_cs_start;
 	wire eng_rx_done   = spe && cs_low && sck_rise && (bit_idx == 3'd7);
+
+	initial drop_preloaded_on_cs = $test$plusargs("drop_preloaded_on_cs");
 
 	always @(posedge SBCLKI) begin
 		ack_r <= 1'b0;

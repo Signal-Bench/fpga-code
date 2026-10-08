@@ -80,6 +80,12 @@ Simulation checks raw output without commands, FIFO stalls, continuity across
 CS changes, binary bytes, idle reads, and ignored command patterns on MOSI.
 It cross-checks the message independently of the DUT.
 
+To model the risky silicon behavior where the hard SPI block does not preserve
+a preloaded transmit shifter across CS assertions, run the compiled testbench
+with `+drop_preloaded_on_cs`. A failure there means raw payload bytes can be
+lost at transaction boundaries unless the stream is framed or the SPI slave is
+implemented outside the hard IP.
+
 The behavioral hard-IP model is not silicon accurate. Confirm the first byte
 at startup, empty-TX dummy behavior, CS boundaries, and sampling on hardware
 at 2 MHz. This change does not correct electrical bit errors or recover
