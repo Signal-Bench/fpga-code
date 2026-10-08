@@ -113,9 +113,11 @@ buffered, `(read_len − 24) / 2`, and `MAX_FRAME_SAMPLES` (2036, for a
    math mod 2³².
 5. `expected = start + count`. Send that as the ack on the next read.
 
-**What the ack means today:** "the MCU received it." If BLE then fails to
-send the data, it is gone. To make the whole chain lossless, the MCU would
-ack only after BLE has accepted the data. See the BLE notes in the MCU repo.
+**What the ack means today:** the MCU sends the next read, and so the ack,
+only after BLE has accepted the previous frame's samples, so BLE congestion
+backs up into this buffer. It does not mean the phone received them, and
+the MCU still discards data while no phone is subscribed. See the BLE notes
+in the MCU repo.
 
 ## Wiring
 
