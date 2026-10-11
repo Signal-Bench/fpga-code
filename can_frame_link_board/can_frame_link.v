@@ -1,0 +1,315 @@
+/*
+ * can_frame_link.v — SignalBench PCBA (U7 iCE40UP5K-SG48) top: every board
+ * receiver -> records -> framed SPI link -> ESP32-H2.
+ *
+ *   CAN    pin 27 (U15 TCAN330)       -> can_bit_timing -> can_frame_fsm -> 20-byte record
+ *   UART 0 pin 23 (U13 RS-232 ROUT1)  -> uart_rx_sniff  ->  8-byte record
+ *   UART 1 pin 25 (U13 RS-232 ROUT2)  -> uart_rx_sniff  ->  8-byte record
+ *   UART 2 pin 26 (U14 RS-485 RO)     -> uart_rx_sniff  ->  8-byte record
+ *        -> one holding slot per source -> oldest-first arbiter (never splits a
+ *           record) -> spi_frame_link (atomic variable-length push, 4 x SPRAM
+ *           ring, logic SPI slave, A5 5A 01 frames, CRC-16, MCU ack) -> MISO (46)
+ *
+ * Contract: validation/battery_can_chain/CONTRACT.md §1, §4, §5 (authoritative).
+ *
+ * Partner sources: can_bit_timing.v, can_crc15.v, can_frame_fsm.v unchanged from
+ * Signal-Bench/fpga-code main 2eca834; the CAN timestamp and record layout are
+ * taken from can_sniffer.v (same commit); spi_frame_link.v is derived from
+ * spi_frame_stream.v (feat/spi-frame-stream 58a12d6).  See SOURCE_COMMIT.
+ * uart_rx_sniff.v and this file are new.
+ *
+ * Clock: one domain, the 12 MHz board oscillator on pin 44 (G6, Y1 -> U4,
+ * +/-20 ppm).  CAN needs df < 0.98% (clock_choice.md); SB_HFOSC is +/-10% and is
+ * not used.  CAN: BRP=0 -> 12 tq/bit -> 1 Mbit/s; bit rate = 1 MHz/(BRP+1).
+ * UART: 16x NCO per channel from the same clock.  Consequence of 12 MHz for the
+ * logic SPI slave: SCK ceiling 1.5 MHz (was 3 MHz at 24 MHz); recommended 1 MHz.
+ *
+ * CAN record (20 bytes = 10 samples):
+ *   [0] 0xAA  [1] {ide, rtr, overload, ack_ok, crc_ok, err[2:0]}
+ *   [2..5] identifier, 29 bits right-justified, big-endian
+ *   [6] {dropped, 3'b000, dlc[3:0]}  [7..14] data[0..7] left-justified
+ *   [15..18] timestamp, CAN bit times since configuration, big-endian, at SOF
+ *   [19] 0x55
+ * UART record (8 bytes = 4 samples):
+ *   [0] 0xC5  [1] {chan[1:0], framing_err, brk, dropped, 3'b000}  [2] data
+ *   [3..6] timestamp, microseconds since configuration, big-endian, at the
+ *          start-bit edge   [7] 0x5A
+ * Sample k = record[2k] | record[2k+1] << 8; the link sends samples low byte
+ * first, so the record bytes appear on MISO in their original order.
+ *
+ * `dropped` (both record types): at least one record of ANY type was lost
+ * since the previous record that reached the buffer.  The frame header's
+ * `dropped` field counts RECORDS of any type (see spi_frame_link.v change 3).
+ *
+ * Arbitration: each source has one holding slot.  When the link is idle, the
+ * OLDEST occupied slot is granted (ties in the same clock: CAN, UART0, UART1,
+ * UART2), its record is copied to the output buffer and the slot frees at once.
+ * The link writes it in 10 (CAN) or 4 (UART) clocks.  Worst case all four
+ * slots full = 22 clocks; the fastest any one source refills is one CAN bit
+ * (12 clocks, BRP=0) or one UART frame (>= 160 clocks at 750 kbaud), so a slot
+ * is never overrun in practice.  If it ever is, the NEW record is dropped and
+ * counted (drop_add) — never a split or a corrupted record.
+ *
+ * Pins driven: spi_miso only, and only while spi_cs is low (tri-stated when CS
+ * is high, per FPGA_PINOUT_ICE40UP5K-SG48.md).  All receiver inputs have the
+ * pad pull-up on (idle = recessive / mark during power ramp).  Pin 16 (FT_SSn),
+ * pin 18 (RT_MOSI), probe pins and RGB0-2 are untouched.
+ */
+`default_nettype none
+
+module top #(
+	parameter [7:0]   BRP               = 8'd0,      // CAN: tq = (BRP+1) clk; 0 -> 1 Mbit/s
+	parameter integer UART0_BAUD        = 9_600,     // RS-232 P1.7 RX_IN  (CONTRACT §6)
+	parameter integer UART1_BAUD        = 9_600,     // RS-232 P1.8 TX_IN
+	parameter integer UART2_BAUD        = 9_600,     // RS-485 P1.3/P1.4
+	parameter integer BUF_AW            = 16,        // 64 Ki samples
+	parameter integer MAX_FRAME_SAMPLES = 2036,
+	parameter [31:0]  INITIAL_OFFSET    = 32'd0      // test hook only
+) (
+	input  wire clk_12m,       // 44  IOB_3b_G6  <- Y1 12 MHz via U4 2Y
+	input  wire can_rx_pin,    // 27  IOT_38b    <- U15 TCAN330 RXD
+	input  wire uart0_pin,     // 23  IOT_37a    <- U13 ROUT1 (FPGA_RS232_RX_OUT, P1.7)
+	input  wire uart1_pin,     // 25  IOT_36b    <- U13 ROUT2 (FPGA_RS232_TX_OUT, P1.8)
+	input  wire uart2_pin,     // 26  IOT_39a    <- U14 RO    (FPGA_RS485_RX, P1.3/4)
+	input  wire spi_sck,       // 20  RT_SCK     <- ESP32 GPIO10 (shared with LCD SCK)
+	input  wire spi_cs,        // 47  RT_CSn     <- ESP32 GPIO27, active low
+	input  wire spi_mosi,      // 48  FPGA_IRQn  <- ESP32 GPIO22 (defect F1 rework)
+	output wire spi_miso       // 46  RT_MISO    -> ESP32 GPIO11
+);
+	localparam integer CLK_HZ = 12_000_000;
+	wire clk = clk_12m;
+
+	// ----------------------------------------------------------------
+	// Pads
+	// ----------------------------------------------------------------
+	wire can_rx, uart0_rx, uart1_rx, uart2_rx;
+	SB_IO #(.PIN_TYPE(6'b0000_01), .PULLUP(1'b1)) u_can_io   (.PACKAGE_PIN(can_rx_pin), .D_IN_0(can_rx));
+	SB_IO #(.PIN_TYPE(6'b0000_01), .PULLUP(1'b1)) u_uart0_io (.PACKAGE_PIN(uart0_pin),  .D_IN_0(uart0_rx));
+	SB_IO #(.PIN_TYPE(6'b0000_01), .PULLUP(1'b1)) u_uart1_io (.PACKAGE_PIN(uart1_pin),  .D_IN_0(uart1_rx));
+	SB_IO #(.PIN_TYPE(6'b0000_01), .PULLUP(1'b1)) u_uart2_io (.PACKAGE_PIN(uart2_pin),  .D_IN_0(uart2_rx));
+
+	// MISO: output enable straight from the CS pad (not the synchroniser), so
+	// the first bit (0xA5 MSB) is on the wire as soon as CS falls.
+	wire miso_d;
+	SB_IO #(.PIN_TYPE(6'b1010_01), .PULLUP(1'b0)) u_miso_io (
+		.PACKAGE_PIN(spi_miso), .OUTPUT_ENABLE(~spi_cs), .D_OUT_0(miso_d));
+
+	// ----------------------------------------------------------------
+	// Power-on reset (as can_sniffer.v) and the microsecond timebase
+	// ----------------------------------------------------------------
+	reg [7:0] por = 8'd0;
+	wire      rst = ~por[7];
+	always @(posedge clk) if (!por[7]) por <= por + 8'd1;
+
+	reg [3:0]  us_div = 4'd0;
+	reg [31:0] us_ctr = 32'd0;
+	always @(posedge clk) begin
+		if (rst) begin
+			us_div <= 4'd0;
+			us_ctr <= 32'd0;
+		end else if (us_div == (CLK_HZ / 1_000_000) - 1) begin
+			us_div <= 4'd0;
+			us_ctr <= us_ctr + 32'd1;
+		end else
+			us_div <= us_div + 4'd1;
+	end
+
+	// ----------------------------------------------------------------
+	// CAN decoder chain (partner modules, unchanged)
+	// ----------------------------------------------------------------
+	wire bus_idle, sample_tick, sample_bit, bit_tick, rx_sync, hard_sync, resync;
+	wire        frame_strobe, frame_ide, frame_rtr, frame_crc_ok;
+	wire        frame_ack_ok, frame_overload;
+	wire [28:0] frame_id;
+	wire [3:0]  frame_dlc;
+	wire [63:0] frame_data;
+	wire [2:0]  frame_err;
+
+	can_bit_timing u_bt (
+		.clk(clk), .rst(rst), .brp(BRP),
+		.rx_raw(can_rx), .bus_idle(bus_idle),
+		.sample_tick(sample_tick), .sample_bit(sample_bit),
+		.bit_tick(bit_tick), .rx_sync(rx_sync),
+		.hard_sync(hard_sync), .resync(resync)
+	);
+
+	can_frame_fsm u_fsm (
+		.clk(clk), .rst(rst),
+		.sample_tick(sample_tick), .sample_bit(sample_bit),
+		.bus_idle(bus_idle), .frame_strobe(frame_strobe),
+		.frame_id(frame_id), .frame_ide(frame_ide), .frame_rtr(frame_rtr),
+		.frame_dlc(frame_dlc), .frame_data(frame_data),
+		.frame_crc_ok(frame_crc_ok), .frame_ack_ok(frame_ack_ok),
+		.frame_overload(frame_overload), .frame_err(frame_err)
+	);
+
+	// CAN timestamp in bit times, latched at SOF (as can_sniffer.v).
+	reg [31:0] ts_ctr    = 32'd0;
+	reg [31:0] ts_latch  = 32'd0;
+	reg        idle_prev = 1'b1;
+	always @(posedge clk) begin
+		if (bit_tick) ts_ctr <= ts_ctr + 32'd1;
+		idle_prev <= bus_idle;
+		if (idle_prev & ~bus_idle) ts_latch <= ts_ctr;
+	end
+
+	// ----------------------------------------------------------------
+	// UART receivers
+	// ----------------------------------------------------------------
+	wire [2:0]  u_stb, u_fe, u_brk, u_busy;
+	wire [7:0]  u_data [0:2];
+	wire [31:0] u_ts   [0:2];
+
+	uart_rx_sniff #(.CLK_HZ(CLK_HZ), .BAUD(UART0_BAUD)) u_uart0 (
+		.clk(clk), .rst(rst), .rx(uart0_rx), .us_now(us_ctr),
+		.strobe(u_stb[0]), .data(u_data[0]), .fe(u_fe[0]), .brk(u_brk[0]), .ts(u_ts[0]), .busy(u_busy[0]));
+	uart_rx_sniff #(.CLK_HZ(CLK_HZ), .BAUD(UART1_BAUD)) u_uart1 (
+		.clk(clk), .rst(rst), .rx(uart1_rx), .us_now(us_ctr),
+		.strobe(u_stb[1]), .data(u_data[1]), .fe(u_fe[1]), .brk(u_brk[1]), .ts(u_ts[1]), .busy(u_busy[1]));
+	uart_rx_sniff #(.CLK_HZ(CLK_HZ), .BAUD(UART2_BAUD)) u_uart2 (
+		.clk(clk), .rst(rst), .rx(uart2_rx), .us_now(us_ctr),
+		.strobe(u_stb[2]), .data(u_data[2]), .fe(u_fe[2]), .brk(u_brk[2]), .ts(u_ts[2]), .busy(u_busy[2]));
+
+	// ----------------------------------------------------------------
+	// Records as sample vectors (sample k in bits [16k+15:16k]).  The
+	// `dropped` bit is left 0 here and inserted at grant time.
+	// ----------------------------------------------------------------
+	function [159:0] can_vec(input [28:0] id, input [63:0] d, input [31:0] ts,
+	                         input [3:0] dlc, input [2:0] err,
+	                         input ide, input rtr, input ovl, input ack, input crc);
+		begin
+			can_vec = {
+				8'h55,     ts[7:0],          // s9
+				ts[15:8],  ts[23:16],        // s8
+				ts[31:24], d[7:0],           // s7
+				d[15:8],   d[23:16],         // s6
+				d[31:24],  d[39:32],         // s5
+				d[47:40],  d[55:48],         // s4
+				d[63:56],  {4'b0000, dlc},   // s3  (byte 6 bit 7 = dropped)
+				id[7:0],   id[15:8],         // s2
+				id[23:16], {3'b000, id[28:24]},  // s1
+				{ide, rtr, ovl, ack, crc, err}, 8'hAA   // s0
+			};
+		end
+	endfunction
+
+	function [63:0] uart_vec(input [1:0] chan, input fe, input brk,
+	                         input [7:0] d, input [31:0] ts);
+		begin
+			uart_vec = {
+				8'h5A,     ts[7:0],          // s3
+				ts[15:8],  ts[23:16],        // s2
+				ts[31:24], d,                // s1
+				{chan, fe, brk, 1'b0, 3'b000}, 8'hC5   // s0 (byte 1 bit 3 = dropped)
+			};
+		end
+	endfunction
+
+	localparam integer CAN_DROP_BIT  = 3 * 16 + 7;   // byte 6 bit 7
+	localparam integer UART_DROP_BIT = 8 + 3;        // byte 1 bit 3
+
+	// ----------------------------------------------------------------
+	// Holding slots: 0 = CAN, 1..3 = UART 0..2
+	// ----------------------------------------------------------------
+	wire [3:0] arrive = {u_stb[2], u_stb[1], u_stb[0], frame_strobe} & {4{~rst}};
+
+	reg  [3:0]   valid = 4'd0;
+	reg  [159:0] slot_can = 160'd0;
+	reg  [63:0]  slot_u [1:3];
+	reg  [3:0]   ahead [0:3];     // ahead[i][j]: slot j's record is older than slot i's
+	initial begin : init_slots
+		integer n;
+		slot_u[1] = 64'd0; slot_u[2] = 64'd0; slot_u[3] = 64'd0;
+		for (n = 0; n < 4; n = n + 1) ahead[n] = 4'd0;
+	end
+
+	// Grant: the oldest occupied slot, when the link can take a record.
+	wire       rec_busy, rec_accept, rec_dropped;
+	wire [3:0] rec_idx;
+	reg  [3:0] eligible;
+	reg  [3:0] grant;
+	always @(*) begin : arb
+		integer e;
+		for (e = 0; e < 4; e = e + 1)
+			eligible[e] = valid[e] && ((valid & ahead[e]) == 4'd0);
+		grant = 4'd0;
+		if (!rec_busy && !rst) begin
+			if      (eligible[0]) grant = 4'b0001;
+			else if (eligible[1]) grant = 4'b0010;
+			else if (eligible[2]) grant = 4'b0100;
+			else if (eligible[3]) grant = 4'b1000;
+		end
+	end
+
+	wire [3:0] load    = arrive & (~valid | grant);   // slot free (or freeing now)
+	wire [3:0] overrun = arrive & valid & ~grant;     // slot still full: drop the new one
+	wire [2:0] drop_add = {2'b00, overrun[0]} + {2'b00, overrun[1]} + {2'b00, overrun[2]} + {2'b00, overrun[3]};
+
+	always @(posedge clk) begin : slots
+		integer ii, jj;
+		valid <= (valid & ~grant) | load;
+
+		if (load[0])
+			slot_can <= can_vec(frame_id, frame_data, ts_latch, frame_dlc, frame_err,
+			                    frame_ide, frame_rtr, frame_overload, frame_ack_ok, frame_crc_ok);
+		if (load[1]) slot_u[1] <= uart_vec(2'd0, u_fe[0], u_brk[0], u_data[0], u_ts[0]);
+		if (load[2]) slot_u[2] <= uart_vec(2'd1, u_fe[1], u_brk[1], u_data[1], u_ts[1]);
+		if (load[3]) slot_u[3] <= uart_vec(2'd2, u_fe[2], u_brk[2], u_data[2], u_ts[2]);
+
+		// Age matrix.  A slot loading now is behind every slot that stays
+		// occupied, and behind higher-priority slots loading in the same clock.
+		for (ii = 0; ii < 4; ii = ii + 1)
+			for (jj = 0; jj < 4; jj = jj + 1)
+				if (ii == jj)
+					ahead[ii][jj] <= 1'b0;
+				else if (load[ii])
+					ahead[ii][jj] <= (valid[jj] & ~grant[jj]) | (load[jj] & (jj < ii));
+				else if (load[jj])
+					ahead[ii][jj] <= 1'b0;
+	end
+
+	// ----------------------------------------------------------------
+	// Output buffer: the granted record, with the dropped flag inserted.
+	// ----------------------------------------------------------------
+	reg  [159:0] out_vec = 160'd0;
+	reg          drop_stky = 1'b0;    // a record was lost since the last one buffered
+
+	wire        rec_req = (grant != 4'd0);
+	wire [3:0]  rec_len = grant[0] ? 4'd10 : 4'd4;
+
+	always @(posedge clk) begin
+		if (grant[0]) begin
+			out_vec <= slot_can;
+			out_vec[CAN_DROP_BIT] <= drop_stky;
+		end else if (rec_req) begin
+			out_vec <= {96'd0, grant[1] ? slot_u[1] : grant[2] ? slot_u[2] : slot_u[3]};
+			out_vec[UART_DROP_BIT] <= drop_stky;
+		end
+		// Set wins: a drop in the same clock as an accept belongs after it.
+		if (rec_dropped || overrun != 4'd0)
+			drop_stky <= 1'b1;
+		else if (rec_accept)
+			drop_stky <= 1'b0;
+	end
+
+	wire [15:0] rec_sample = out_vec[{rec_idx, 4'b0000} +: 16];
+
+	// ----------------------------------------------------------------
+	// Framed link
+	// ----------------------------------------------------------------
+	wire ctrl_good, frame_sent;
+	spi_frame_link #(
+		.BUF_AW(BUF_AW),
+		.MAX_FRAME_SAMPLES(MAX_FRAME_SAMPLES),
+		.MAX_REC_SAMPLES(10),
+		.INITIAL_OFFSET(INITIAL_OFFSET)
+	) u_link (
+		.clk(clk),
+		.spi_sck(spi_sck), .spi_cs(spi_cs), .spi_mosi(spi_mosi), .spi_miso(miso_d),
+		.rec_req(rec_req), .rec_len(rec_len), .rec_idx(rec_idx), .rec_sample(rec_sample),
+		.rec_busy(rec_busy), .rec_accept(rec_accept), .rec_dropped(rec_dropped),
+		.drop_add(drop_add),
+		.ctrl_good(ctrl_good), .frame_sent(frame_sent)
+	);
+
+endmodule
