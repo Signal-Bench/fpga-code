@@ -1,0 +1,19 @@
+Partner repository: Signal-Bench/fpga-code (local clone, not pushed anywhere)
+
+can_sniffer/  branch main, commit 2eca8348ec84907c868bb73b2e2306c47ff4e271
+              (last commit touching can_sniffer/: e0867247f466ede676636fd830cac071638cb707)
+  can_bit_timing.v      copied unmodified
+  can_crc15.v           copied unmodified
+  can_frame_fsm.v       copied unmodified
+  partner_tb/can_bit_timing_tb.v, partner_tb/can_frame_fsm_tb.v   copied unmodified
+  can_sniffer.v         NOT copied; its timestamp latch, POR and 20-byte record
+                        layout are reproduced in can_frame_link.v
+
+spi_frame_stream/  branch origin/feat/spi-frame-stream, commit 58a12d6e75dd92ee8cd29762cb47b56a811b4a9f
+  partner_tb/spi_frame_stream_orig.v      unmodified reference copy (baseline sim)
+  partner_tb/spi_frame_stream_tb_orig.v   unmodified copy of the testbench
+  spi_frame_link.v      DERIVED from spi_frame_stream.v (original header kept;
+                        changes listed in its header)
+
+New (SignalBench, 2026-10-11): can_frame_link.v, uart_rx_sniff.v, can_frame_link_tb.v,
+ice40_sim_models.v, partner_tb/spi_frame_stream_12m_wrap.v, partner_tb/patch_tb_12m.sed
