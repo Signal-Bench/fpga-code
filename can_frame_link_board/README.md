@@ -211,8 +211,9 @@ every mode change, and `rise` keeps counting across modes but only edges seen in
   carries `dropped`.
 * The record is taken every `HB_PERIOD_US` = 100 000 µs of `us_ctr` (the same µs counter as UART), on the first clock
   of the new period, so `ts_us` = k × 100 000 exactly. Level, rise and glitch are sampled on that same clock.
-* The pad pull-up is off (U19 drives the pin). After configuration the filter starts at level 0 (the Pi line rests
-  low). If the pin is already high, the first record shows level 1 and `rise` = 1.
+* The pad pull-up is off (U19 drives the pin). After configuration (and on every mode change) the filter starts at the
+  pin's current level, so a pin that is already high shows level 1 with `rise` = 0 (protocol v3; the 2026-10-11 build
+  started at 0 and counted that as a rise).
 
 ## Arbiter
 
@@ -240,21 +241,21 @@ every mode change, and `rise` keeps counting across modes but only edges seen in
 
 | Resource | Used | Device | % |
 |---|---|---|---|
-| Logic cells | 4289 | 5280 | 81 % (flashed 2026-10-11 build: 3675 = 69 %) |
+| Logic cells | 4351 | 5280 | 82 % (flashed 2026-10-11 build: 3675 = 69 %) |
 | SPRAM (16 K × 16) | 4 | 4 | 100 % (the 64 Ki-sample ring) |
 | EBR | 0 | 30 | 0 % |
 | SB_IO | 17 | 39 | |
 | Global buffers | 8 | 8 | 100 % (clock + auto-promoted enables/resets; no second clock) |
 | PLL / DSP / HFOSC / SB_SPI | 0 | | |
 
-Timing at the 12 MHz constraint: **nextpnr Fmax 18.88 MHz, icetime 18.96 MHz (52.73 ns path vs 83.3
-ns), PASS with 1.57× margin.**
+Timing at the 12 MHz constraint: **nextpnr Fmax 17.91 MHz, icetime 18.11 MHz (55.21 ns path vs 83.3
+ns), PASS with 1.49× margin.** Seed sweep after the review fixes: seeds 1-6 all place, 17.6-18.5 MHz.
 
 **Synthesis option `-dffe_min_ce_use 4` (new for v3, in the Makefile).** Without it the v3 netlist has 230 control
 sets (clock-enable / reset pairs; an iCE40 tile of 8 logic cells shares one), 144 of them with fewer than 8 FFs, and
 nextpnr's placer failed to legalise on 11 of 12 seeds (HeAP, SA and static placers alike) at 82 % LC. With it yosys
-builds small-fanout enables from LUTs instead: 156 control sets, and 10 of 10 seeds tried (1-5, at both 4 and 8)
-place, Fmax 17.9-19.0 MHz. If a later change makes placement fail again, look at control sets before features.
+builds small-fanout enables from LUTs instead: 156 control sets, and every seed tried places (before the review
+fixes: 1-5 at both 4 and 8, 17.9-19.0 MHz; after: 1-6, 17.6-18.5 MHz). If a later change makes placement fail again, look at control sets before features.
 The contract's fallback order for cutting features (SPI LSB-first, then the DIO glitch filter) was not needed.
 
 ## Protocol v3
@@ -275,10 +276,20 @@ CAN, RS-232 ×2 and RS-485 are decoded in every mode. All probe pads share one 2
 previous-sample register (edges = "now ≠ before"); UART3 keeps its own synchroniser inside `uart_rx_sniff`.
 Every decoder oversamples at the 12 MHz core clock; there is no probed-clock domain (all 8 SB_GB are in use).
 **Mode change:** each decoder is held in reset whenever probe_mode is not its own, so a change always starts the new
-decoder from idle; a half-received byte of the old mode is discarded, and an event the old decoder produced in the
-clock of the change is discarded too. The 8 glitch filters are reset on every mode change; the counter's `rise`
-total is never reset (it counts filtered rising edges seen in mode 0), its `glitch` count is cleared.
-`probe_spi` is also reset when spi_cfg changes.
+decoder from idle; a half-received byte of the old mode is discarded. A **completed** record that the change
+discards (an I2C/SPI byte still held for its follow-up event, an event the old decoder produced in the clock of the
+change, a DIO change inside its coalescing window, or an SPI byte held when spi_cfg changes) is counted as a
+dropped record: frame header `dropped` + 1 and `dropped` on the next record (`lost_rec` in `can_frame_link.v`).
+The 8 glitch filters restart on every mode change **at the current pin level**, so re-entering mode 0 with PROBE2
+high gives level 1 and no phantom rising edge; the counter's `rise` total is never reset (it counts filtered rising
+edges seen in mode 0), its `glitch` count is cleared. `probe_spi` is also reset when spi_cfg changes. The probe UART
+(like every `uart_rx_sniff`) accepts a start bit only after its line has been seen high once since reset, so
+entering mode 0 with PROBE1 low gives no break / framing-error record.
+
+**Deglitch (contract §2):** I2C SCL and SDA, and SPI SCK, CS, MOSI and MISO, each pass a 2-sample stability filter
+(the level changes only when two consecutive samples, ~167 ns, agree). All lines of a decoder get the same filter,
+so their timing relative to each other is unchanged. Single-sample crossings (ringing, a 60 ns / 40 ns double
+crossing on an SCL edge) are ignored; SCK / SCL high and low times must be ≥ ~170 ns.
 
 ### Records (contract §2; byte 1 bit 3 = `dropped`, inserted at arbiter grant)
 
@@ -290,16 +301,20 @@ total is never reset (it counts filtered rising edges seen in mode 0), its `glit
   the next bus event so `stop` / `timeout` can be set on it: it goes out at the next byte's first bit (no flag), at a
   repeated START (no flag; the next byte gets `rstart`), at STOP (`stop`) or at the timeout (`timeout`). A STOP or
   timeout with nothing held gives a record with data_valid = 0 (start/rstart set if it is the first event after a
-  START). **Timeout:** inside a transaction, no SCL/SDA edge for 1 ms (`I2C_TIMEOUT_US`); the transaction is closed,
-  the next START reports `start`. **Partial:** the transaction ended (STOP, timeout or repeated START) after 1..8
-  committed bits but before the ACK clock: partial = 1, data_valid = 1, ack = 0, data = the bits received
-  MSB-aligned. A STOP outside a transaction gives no record. Tested at 400 kHz and 1 MHz, START hold 200-700 ns.
+  START). **Timeout:** inside a transaction, the bus released (SCL **and** SDA high) for 1 ms (`I2C_TIMEOUT_US`,
+  2..1023); the transaction is closed, the next START reports `start`. SCL held low (clock stretching, any length)
+  never times out. **Partial** (contract ruling): the transaction ended (STOP, timeout or repeated START) after 1..8
+  committed bits but before the ACK clock: partial = 1, **data_valid = 0, ack = 0**, data = the bits received
+  MSB-aligned. A STOP outside a transaction gives no record. Tested at 400 kHz and 1 MHz, START hold 200-700 ns,
+  a 5 ms clock stretch and SCL double crossings.
 * **SPI `5B flags mosi miso ts[4 BE] nbits B5`.** flags = {cs_start, cs_end, partial, data_valid, dropped, 0, 0, 0}.
   spi_cfg = {lsb_first, cpol, cpha}; the sampling edge is rising for modes 0/3 and falling for 1/2. MOSI/MISO are
-  taken from the same synchronised sample in which the SCK edge is first seen (≤ 83 ns after it), where they are
-  stable for half an SCK period: **1.5 MHz (the requirement) and 2 MHz are tested in all 4 modes, MSB and LSB first;
-  the theoretical ceiling is about 3 MHz** (half period ≥ 2 clocks). After reset the decoder waits for CS high, so a
-  mode change in mid-transaction does not decode its tail. A byte completes at its 8th sampling edge (ts) and is held
+  taken from the same filtered sample in which the SCK edge is first seen, where they are stable for half an SCK
+  period minus the device's output delay: **supported to 1.5 MHz (contract), tested in all 4 modes, MSB and LSB
+  first, at 500 kHz, 1.5 MHz and 2 MHz** (SCK high and low ≥ ~170 ns; 4 MHz or a 100 ns high pulse do not decode).
+  The first sampling edge may follow CS fall immediately: an edge seen in the same clock as CS falling is bit 0
+  (tested with CS 20, 60 and 100 ns before the first edge). After reset the decoder waits for CS high, so a mode
+  change in mid-transaction does not decode its tail. A byte completes at its 8th sampling edge (ts) and is held
   until the next event: next byte's first edge (no flag) or CS rise (cs_end). CS rise with no byte held: a cut-short
   byte gives partial = 1, nbits = 1..7, bits MSB-aligned (MSB first) or LSB-aligned (LSB first); no clocks at all gives
   an end-only record (data_valid = 0, nbits = 0, cs_start = cs_end = 1). A sampling edge in the same 83 ns sample as
@@ -310,7 +325,8 @@ total is never reset (it counts filtered rising edges seen in mode 0), its `glit
   record; levels = filtered levels, changed = levels XOR the last record, ts = µs at the first accepted change minus
   1 (the filter delay), i.e. the microsecond of the pin edge to within ±1 µs. Heartbeat on each 100 ms boundary of
   `us_ctr`: heartbeat = 1, changed = 0, ts = k × 100000 when the PROBE slot is free (else as soon as it is). On entering
-  mode 1 the filters start at 0, so probes already high give a first record ~1 µs later with those bits in `changed`.
+  mode 1 the filters start at the pin levels and the last-record levels at 0, so probes already high give an entry
+  record at once with those bits in `changed`.
   `changed` is relative to the last record offered to the slot, even if the link then dropped it (the next record
   carries `dropped`).
 
@@ -336,34 +352,40 @@ unaffected. Reset: gen 0, probe_mode 0, spi_cfg 0, div 1250/1250/1250/104.
 
 ## Verification, protocol v3 (actual results, 2026-11-01)
 
-All from a clean `out/`: `make -j6 build sim-partner sim-top vectors` (exit 0, no FAIL line anywhere in the log).
+All from a clean `out/`: `make -j6 build sim-partner sim-top vectors` (exit 0, no FAIL line anywhere in the log),
+rerun after the review fixes (deglitch, I2C timeout rule, SPI CS lead, partial ruling, counted discards).
 
 | Run | Result |
 |---|---|
 | `make sim-partner` | unchanged suite: bit timing 11 × `sampled 120/120 PASS` (incl. ±5000/±9000 ppm), `ALL TESTS PASSED (16 records)`, 4 × `PASS: all spi_frame_stream tests completed successfully` (24 MHz baseline + 12 MHz zero/small/full) |
-| `sim-top-small` (1 Ki buffer, overflow) | `PASS: can_frame_link end-to-end`: 2157 records (217 CAN, 66/29/23/1564 UART0..3, 6 COUNTER, 61 I2C, 118 SPI, 73 DIO), 107 dropped in phase C, all reported |
-| `sim-top-full` (4 SPRAM, offsets through 2³²) | `PASS: can_frame_link end-to-end`: 2002 records (130 CAN, 62/25/20/1508, 5 COUNTER, 61 I2C, 118 SPI, 73 DIO), 0 dropped |
-| `sim-top-baud` (UART 115200/230400/57600/115200 set by a C3 block at start, CAN +3000 ppm, 2 KB reads) | `PASS: can_frame_link end-to-end`: 2005 records, 0 dropped |
+| `sim-top-small` (1 Ki buffer, overflow) | `PASS: can_frame_link end-to-end`: 2182 records (217 CAN, 66/29/23/1564 UART0..3, 6 COUNTER, 67 I2C, 136 SPI, 74 DIO), 107 dropped in phase C, all reported |
+| `sim-top-full` (4 SPRAM, offsets through 2³²) | `PASS: can_frame_link end-to-end`: 2027 records (130 CAN, 62/25/20/1508, 5 COUNTER, 67 I2C, 136 SPI, 74 DIO), 0 missing |
+| `sim-top-baud` (UART 115200/230400/57600/115200 set by a C3 block at start, CAN +3000 ppm, 2 KB reads) | `PASS: can_frame_link end-to-end`: 2030 records, 0 missing |
 | `make vectors` (BUF_AW 16) | `PASS: can_frame_link end-to-end`; frames_vectors*.txt regenerated, v3_records.txt copied from the small run |
 
 The v3 phases in every configuration (E-H, after the unchanged A-D):
 
-* **E, I2C (mode 3, set while CAN/UART stream):** 61 records: writes, write + repeated START + read with the last
-  byte NACKed, START+STOP marker, NACKed address, partial bytes (as a later and as the first byte), timeout on a held
-  byte and with nothing held, the next START after a timeout is `start`, START sweep (SDA→SCL hold 200/300/450/700 ns
-  × 4 phases against the clock), 1 MHz Fm+, and a switch to SPI in the middle of a byte (the earlier byte goes out,
-  the 4 bits do not).
-* **F, SPI (mode 2):** 118 records: all 8 spi_cfg values (modes 0-3 × MSB/LSB first), each at 1.5 MHz (4 bytes; 3
+* **E, I2C (mode 3, set while CAN/UART stream):** 67 records: writes, write + repeated START + read with the last
+  byte NACKed, START+STOP marker, NACKed address, partial bytes (as a later and as the first byte; data_valid 0),
+  timeout (bus released 1 ms) on a held byte and with nothing held, the next START after a timeout is `start`, a
+  5 ms clock stretch (no timeout), SCL double crossings (60 ns high / 40 ns low) on three bits, START sweep (SDA→SCL
+  hold 200/300/450/700 ns × 4 phases against the clock), 1 MHz Fm+, and a switch to SPI in the middle of a byte (the
+  earlier byte goes out, the 4 bits do not).
+* **F, SPI (mode 2):** 136 records: all 8 spi_cfg values (modes 0-3 × MSB/LSB first), each at 1.5 MHz (4 bytes; 3
   bytes + 5-bit partial; 3-bit partial only), 500 kHz and 2 MHz; a CS pulse with no clocks (end-only record); a
-  12-byte burst; a switch to DIO with CS still low after 1 byte + 3 bits. The stimulus changes MOSI/MISO 100 ns after
-  the shift edge, as a real device does, so sampling on the wrong edge fails.
+  12-byte burst; CS falling 20 / 60 / 100 ns before the first sampling edge; a switch to DIO with CS still low after
+  2 whole bytes (byte 1 goes out; byte 2, still held, is discarded and must show up as `dropped` on the next record
+  and in the header count). The stimulus changes MOSI/MISO 100 ns after the shift edge, as a real device does, so
+  sampling on the wrong edge fails.
 * **G, DIO-8 (mode 1):** 73 records incl. the entry record (PROBE3 high from the SPI phase), walking one, all eight
   at once, 40 random changes, 24 glitch pulses of 100-850 ns on one or four channels (no record), 6 changes of three
   or four channels 50 ns apart (one record each), glitch on one channel with a real edge on another, and 3
   heartbeats (ts exactly k × 100000, loaded within 1 µs of the boundary).
-* **H:** a C3 block with a bad CRC and one with div0 = 15 are both ignored (config and echo unchanged); then mode 0
-  with UART0 at 57600 (div 208) and the probe UART at 230400 (div 52): 24 + 80 records incl. framing error, break,
-  genuine 0x00 and Pi packets; the counter resumes.
+* **H:** C3 blocks with a bad CRC low byte, a bad CRC high byte, div0 = 15, probe_mode 4, spi_cfg bit 3 set, and
+  only 13 bytes clocked are all ignored (config and echo unchanged); 16 bytes clocked (valid, 2 extra bytes) and
+  div2 = 16 exactly are applied. Mode 0 is then entered with PROBE1 low (no UART3 break record) and PROBE2 high (the
+  counter shows level 1, no phantom rise), with UART0 at 57600 (div 208) and the probe UART at 230400 (div 52):
+  24 + 80 records incl. framing error, break, genuine 0x00 and Pi packets; the counter resumes.
 * Throughout: every frame's MISO bytes 3-4 must equal the applied gen / probe_mode (89-133 frames per config);
   every C3 transaction must leave `rd_off`, `sent_hw`, `dropped_reported` and `ctrl_good` unchanged; I2C/SPI/DIO
   records are byte-exact against the stimulus models (timestamps mirrored from the DUT and checked against
@@ -374,14 +396,23 @@ polarity inverted (69), SPI LSB-first ignored (55), DIO glitch filter 2 clocks i
 checked (3), C3 transaction allowed to run the frame decision (13), echo byte 4 stuck at 0 (48), UART0 divisor
 ignored (17, plus watchdog), DIO coalescing window removed (60), SPI CPHA ignored (62; this one first passed, which
 showed that the SPI stimulus changed data on the shift edge itself; the stimulus was fixed to change data 100 ns
-later and the mutation then failed).
+later and the mutation then failed). After the review fixes, each of these also fails: C3 probe_mode / spi_cfg
+range checks removed (5), filters restarting at 0 (phantom counter edge, 4), UART start accepted before the line
+was seen high (198), I2C idle timer reset by any edge instead of counting only while the bus is released (49), I2C
+SCL/SDA filter removed (102), SPI edge in the CS-fall clock not counted (15), discarded records not counted (3).
 
-**Cross-layer:** the ESP firmware's own record parser (`firmware/v3-wt/main/fpga_spi_live/tests/test_link_records`,
-built with ASan/UBSan) replays `v3_records.txt`: `decoded 217/1682/6/61/118/73; 0 mismatches, 0 bad record lines,
-0 resyncs` and its suite prints PASS.
+**Unit level (the reviewer's benches, ports renamed):** I2C: clean 400 kHz write; a 60 ns / 40 ns SCL double
+crossing decodes 0x55 with no spurious record; a 5 ms clock stretch gives both bytes and the STOP; 1 MHz; SDA 30 ns
+ahead of SCL fall. SPI mode 0, 960 bytes per case: 0 wrong at 1.0, 1.5, 2 and 3 MHz 50 % duty, with 70 ns data
+delay, and with CS 0 / 20 / 40 / 60 / 100 / 150 ns before the first edge; 4 MHz and a 100 ns SCK high pulse fail,
+as specified (high / low ≥ ~170 ns). UART: div 16 / 17 / 104 / 1250 / 65535 at ±2 % (±3.5 % at 104), 0 bad.
+
+**Cross-layer:** `make -C firmware/v3-wt/main/fpga_spi_live/tests REC_VECTORS=validation/vectors/v3_records.txt`
+(the ESP firmware's own parser, ASan/UBSan) replays `v3_records.txt`: `decoded 217/1682/6/67/136/74; 0 mismatches,
+0 bad record lines, 0 resyncs`; make exits 0 with each suite's PASS line.
 
 **Not verified:** anything on hardware; the probe input path (470 Ω + 10 k pull-down + TVS, U19) at real edge rates;
-the I2C level on weak-pull-up buses (contract §1 hardware note); SPI above 2 MHz (theoretical ceiling ~3 MHz);
+the I2C level on weak-pull-up buses (contract §1 hardware note); SPI above 1.5 MHz is outside the contract;
 SPRAM behaviour comes from the yosys model.
 
 ## Verification (actual results, 2026-10-11, rerun after §7.1)
@@ -470,7 +501,7 @@ Notes from verification:
 ## Flashed image
 
 **The protocol v3 build is NOT flashed** (2026-11-01). `make build` of branch `feat/protocol-v3` gives sha256
-`01f6de011af63bc139f04946f9cfab4e01f613a044a87c545fca501d82bbcd2e` (yosys / nextpnr from the same OSS CAD Suite,
+`5ebab71f7b91bd57c445e526b146e5e682fbafb2efe19391c1bf44b3c93a34b2` (yosys / nextpnr from the same OSS CAD Suite,
 seed 1, `-dffe_min_ce_use 4`). Its reset config (probe_mode 0, 9600/9600/9600/115200) decodes the same buses
 with the same records as the image below (UART3's reset divisor 104 is 0.16 % fast of 115200, where the old build's
 NCO was exact; well inside the ±4.5 % tolerance), so it can replace it for the battery chain; the ESP firmware must send C3 blocks for

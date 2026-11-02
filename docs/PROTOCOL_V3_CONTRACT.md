@@ -47,8 +47,11 @@ as today for UART). CAN keeps its existing drop bit (byte 6 bit 7).
 
 **I2C flags (byte 1):** bit7 `start` (first byte after START), bit6 `rstart` (first byte after repeated
 START), bit5 `stop` (STOP detected after this event), bit4 `data_valid` (data byte + ack meaningful),
-bit3 `dropped`, bit2 `ack` (SDA low on 9th clock = ACK), bit1 `timeout` (bus idle >1 ms mid-transaction),
-bit0 `partial` (STOP/timeout before 8 bits; data holds bits received, MSB-aligned).
+bit3 `dropped`, bit2 `ack` (SDA low on 9th clock = ACK), bit1 `timeout` (bus idle — SCL **and** SDA both
+high — for >1 ms mid-transaction; SCL held low = clock stretching, never a timeout),
+bit0 `partial` (STOP, rSTART or timeout before the byte and its ACK clock completed; data holds the bits
+received, MSB-aligned). **A partial record has `data_valid=0` and `ack=0`; receivers ignore its ack bit.**
+(Ruled 2026-11-01.)
 One record per completed byte (incl. address byte); a STOP with no pending byte is a record with
 `data_valid=0, stop=1`. ts = µs when the event completes.
 
@@ -56,7 +59,9 @@ One record per completed byte (incl. address byte); a STOP with no pending byte 
 byte), bit5 `partial` (nbits < 8), bit4 `data_valid`, bit3 `dropped`, bits2..0 = 0.
 `nbits` = valid bits in mosi/miso (8 normal, 1–7 partial, 0 for an end-only record with `data_valid=0,
 cs_end=1`). Partial bits are MSB-aligned for MSB-first, LSB-aligned for LSB-first. ts = µs at byte completion.
-Decoder oversamples at 12 MHz (no SCK clock domain); supported SCK ≥ 1.5 MHz, modes 0–3, MSB/LSB first.
+Decoder oversamples at 12 MHz (no SCK clock domain); supported SCK **≤ 1.5 MHz** (SCK high/low ≥ ~170 ns
+after the 2-sample filter), modes 0–3, MSB/LSB first; the first SCK edge may follow CS fall immediately.
+I2C SCL/SDA and SPI SCK pass a 2-sample (~167 ns) stability filter.
 
 **DIO flags (byte 1):** bit3 `dropped`, bit0 `heartbeat` (periodic sample, `changed` = 0). `levels` bit i =
 PROBE(i+1). `changed` = bits that changed since the previous emitted record. Emitted on any change after
@@ -112,6 +117,12 @@ C3 | gen u8 | probe_mode u8 | spi_cfg u8 | div0 u16 LE | div1 u16 LE | div2 u16 
   **whether or not a protocol is selected**, so battery % and error bits stay current on a quiet bus.
   Its MCU err byte is `FF` only while nothing is selected, otherwise the current MCU error bits.
   (Clarified 2026-11-01.)
+- **Overflow-only notification:** when records were dropped and nothing else carries the count, the ESP
+  sends header + `03 02 <u16>` only, with the selected protocol, or protocol `FF` when nothing / all is
+  selected. Receivers must read TLV 03 from a protocol-`FF` notification (heartbeat = `FF` with len 0 only).
+- **Closing group:** if a segment ended with `cont_next` and the transaction then restarts (START, rSTART,
+  CS fall), the ESP first sends an empty group carrying only `cont_prev`:
+  I2C `14 04 ts 12 00 13 01 80`; SPI `23 04 ts 20 00 21 00 22 01 <80|mode>`. Zero-byte groups are valid.
 - TLV = `type u8, length u8, value`. **Receivers skip unknown types** (FSR-APP-001) and reject a
   notification whose TLVs overrun `len` or whose `len` ≠ notification length − 7 (FSR-APP-002).
 - `03 02 <u16 LE>` Overflow (records lost before framing), first TLV when nonzero, any protocol.
