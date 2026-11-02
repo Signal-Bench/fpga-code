@@ -1,9 +1,9 @@
-# can_frame_link_board — CAN + 3 x UART sniffer -> framed SPI link, SignalBench PCBA (U7 UP5K-SG48)
+# can_frame_link_board — CAN + 4 x UART sniffer + PROBE2 edge counter -> framed SPI link, SignalBench PCBA (U7 UP5K-SG48)
 #
 #   make build     bitstream (can_frame_link_board.bin), 12 MHz constraint, timing report
 #   make sim       everything below
 #   make sim-partner   partner testbenches for the reused modules, at 12 MHz
-#   make sim-top       end-to-end testbench, three configurations
+#   make sim-top       end-to-end testbench, three configurations (make -j3 sim-top runs them in parallel)
 #   make vectors   frames_vectors.txt, frames_vectors_records.txt, frames_vectors_esp.txt (ESP host test)
 #   make clean
 #
@@ -21,7 +21,7 @@ simlib   = ice40_sim_models.v
 TT       = can_frame_link_tb
 PT       = spi_frame_stream_tb
 
-.PHONY: build time sim sim-partner sim-top vectors clean
+.PHONY: build time sim sim-partner sim-top sim-top-small sim-top-full sim-top-baud vectors clean
 
 build: $(B)/$(name).bin time
 
@@ -63,23 +63,37 @@ sim-partner: | $(B)
 	vvp -n $(B)/sfs_full.out
 
 # ---- end-to-end ------------------------------------------------------------
-#  small: 1 Ki-sample buffer (overflow test), all UARTs 9600 (tx +2% / -2% / 0)
+#  Every config also runs UART3 (PROBE1, 115200, tx +1.5% unless set) and the
+#  PROBE2 edge counter (bursts, glitches, 100 ms counter records), phase D
+#  (Pi packets back to back) and the non-empty-compare checks.
+#  small: 1 Ki-sample buffer (overflow test incl. UART3 + COUNTER drops), UART0-2 9600 (tx +2% / -2% / 0)
 #  full : real 4-SPRAM buffer, offsets through the 2^32 wrap
-#  baud : UART 115200 / 230400 / 57600 (tx +2% / -2% / -2%), CAN +3000 ppm, 2 KB reads
-sim-top: | $(B)
+#  baud : UART 115200 / 230400 / 57600 / 115200 (tx +2% / -2% / -2% / -2%), CAN +3000 ppm, 2 KB reads
+# Each config passes only if the testbench prints its PASS line (exit status is the gate).
+sim-top: sim-top-small sim-top-full sim-top-baud
+
+sim-top-small: | $(B)
 	iverilog -g2012 -P$(TT).BUF_AW=10 -o $(B)/top_small.out $(simlib) $(rtl) $(TT).v
-	vvp -n $(B)/top_small.out
+	vvp -n $(B)/top_small.out | tee $(B)/top_small.log
+	@grep -q '^PASS: can_frame_link end-to-end' $(B)/top_small.log
+
+sim-top-full: | $(B)
 	iverilog -g2012 -P$(TT).BUF_AW=16 -P$(TT).INITIAL_OFFSET=32\'hFFFFFF00 -o $(B)/top_full.out $(simlib) $(rtl) $(TT).v
-	vvp -n $(B)/top_full.out
+	vvp -n $(B)/top_full.out | tee $(B)/top_full.log
+	@grep -q '^PASS: can_frame_link end-to-end' $(B)/top_full.log
+
+sim-top-baud: | $(B)
 	iverilog -g2012 -P$(TT).BUF_AW=16 -P$(TT).U0_BAUD=115200 -P$(TT).U1_BAUD=230400 -P$(TT).U2_BAUD=57600 \
-		-P$(TT).U2_PPM=-20000 -P$(TT).CAN_PPM=3000 -P$(TT).READ_LEN=2048 -o $(B)/top_baud.out $(simlib) $(rtl) $(TT).v
-	vvp -n $(B)/top_baud.out
+		-P$(TT).U2_PPM=-20000 -P$(TT).U3_PPM=-20000 -P$(TT).CAN_PPM=3000 -P$(TT).READ_LEN=2048 -o $(B)/top_baud.out $(simlib) $(rtl) $(TT).v
+	vvp -n $(B)/top_baud.out | tee $(B)/top_baud.log
+	@grep -q '^PASS: can_frame_link end-to-end' $(B)/top_baud.log
 
 sim: sim-partner sim-top
 
 vectors: | $(B)
 	iverilog -g2012 -P$(TT).BUF_AW=16 -o $(B)/top_vec.out $(simlib) $(rtl) $(TT).v
-	vvp -n $(B)/top_vec.out +dump=frames_vectors.txt +records=frames_vectors_records.txt +esp=frames_vectors_esp.txt
+	vvp -n $(B)/top_vec.out +dump=frames_vectors.txt +records=frames_vectors_records.txt +esp=frames_vectors_esp.txt | tee $(B)/top_vec.log
+	@grep -q '^PASS: can_frame_link end-to-end' $(B)/top_vec.log
 
 clean:
 	rm -rf $(B) $(TT).vcd

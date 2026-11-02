@@ -1,22 +1,34 @@
 `timescale 1ns/1ps
 /*
  * can_frame_link_tb.v — end-to-end testbench for can_frame_link.v
- *                       (CAN + UART0/1/2 -> records -> framed SPI link)
+ *   (CAN + UART0/1/2 + UART3 on PROBE1 + PROBE2 edge counter -> records ->
+ *    framed SPI link)
  *
- * Bus side: the testbench is a CAN transmitter (plus an acknowledging node)
- * and three UART transmitters, all running concurrently.  CAN frames are
- * built bit by bit here — CRC-15 and bit stuffing computed independently of
- * the RTL — at 1 Mbit/s (optionally off-nominal by CAN_PPM).  Each UART
- * transmitter runs at its own baud and ppm offset (default: all 9600 baud,
- * transmitters at +2%, -2% and exact; a second run uses three different bauds) and sends random bytes, back-to-back bursts,
- * a framing error, a break and a genuine 0x00.
+ * Bus side: the testbench is a CAN transmitter (plus an acknowledging node),
+ * four UART transmitters and a PROBE2 edge source, all running concurrently.
+ * CAN frames are built bit by bit here — CRC-15 and bit stuffing computed
+ * independently of the RTL — at 1 Mbit/s (optionally off-nominal by CAN_PPM).
+ * Each UART transmitter runs at its own baud and ppm offset (default: UART0-2
+ * at 9600 baud, transmitters at +2%, -2% and exact; UART3 at 115200, tx
+ * +1.5%; a second run uses other bauds) and sends random bytes, back-to-back
+ * bursts, a framing error, a break and a genuine 0x00.  UART3 also carries
+ * the Pi's 16-byte 'PB' packets back to back (CONTRACT §7.3).
+ *
+ * PROBE2: bursts of known rising-edge counts (1..1000, periods 3-40 us),
+ * injected sub-microsecond glitches (100-850 ns, in both levels, in idle and
+ * inside bursts, as contact bounce before an edge, and one run of 300 in one
+ * heartbeat window to saturate the u8), all kept >= 3 us away from a heartbeat
+ * boundary so the expected values are exact.  The testbench predicts every
+ * counter record on its own (level, rise, glitch, timestamp = k * 100000 us)
+ * at t_por + k * 100 ms - 2 us; the DUT must deliver exactly those bytes, and
+ * load each one within 1 us of t_por + k * 100 ms (heartbeat period).
  *
  * SPI side: the testbench is the ESP32-H2 following the MCU rules of
  * spi_frame_stream/README.md (control block, A5 5A 01 + fit + CRC-16 check,
  * resync on first contact / ACK_REJECTED, skip already-received samples, ack
  * start+count).  Payload bytes are appended to a stream and split into records
- * by marker (0xAA -> 20 bytes, 0xC5 -> 8 bytes), because a record may continue
- * in the next frame when read_len limits the frame.
+ * by marker (0xAA -> 20 bytes, 0xC5 -> 8 bytes, 0xE7 -> 12 bytes), because a
+ * record may continue in the next frame when read_len limits the frame.
  *
  * Checks:
  *  - every record is byte-exact against what the testbench transmitted
@@ -24,17 +36,23 @@
  *    +-2 units of elapsed time since reset);
  *  - each source's records arrive exactly once and in order;
  *  - GLOBAL order: the DUT's holding-slot loads are numbered as they happen
- *    (ties in one clock in CAN, UART0, UART1, UART2 order); delivered records
+ *    (ties in one clock in CAN, UART0..3, COUNTER order); delivered records
  *    must carry strictly increasing numbers, i.e. arrival order is preserved
  *    across record types and the arbiter never reorders or splits;
  *  - a gap in those numbers is a dropped record (overflow phase only); the
  *    next delivered record must carry `dropped`=1, and only then; the frame
  *    header's `dropped` (records) must equal the total gap;
  *  - the arbiter's slots never overrun, the link is never offered a record
- *    while busy, SPRAM reads/writes stay inside the buffered region.
+ *    while busy, SPRAM reads/writes stay inside the buffered region;
+ *  - every compare is non-vacuous: each source must deliver > 0 records, and
+ *    the phases that exercise UART3 / the counter must deliver some.
+ *
+ * Source numbering (also the `R <src>` field of +records): 0 CAN, 1..4 UART
+ * chan 0..3, 5 COUNTER.
  *
  * Plusargs: +dump=<file> (phase-A transfers, T/M/S/E format of the partner's
- * frames.txt), +records=<file> (delivered records in order), +vcd.
+ * frames.txt), +records=<file> (delivered records in order), +esp=<file>
+ * (C/U/E/P replay vectors), +vcd.
  */
 module can_frame_link_tb;
 
@@ -45,14 +63,19 @@ module can_frame_link_tb;
 	parameter integer U0_BAUD        = 9_600;     // DUT parameters (board default, CONTRACT §6)
 	parameter integer U1_BAUD        = 9_600;
 	parameter integer U2_BAUD        = 9_600;
+	parameter integer U3_BAUD        = 115_200;   // PROBE1 (CONTRACT §7.1)
 	parameter integer U0_PPM         = 20_000;    // transmitter offsets: +2%
 	parameter integer U1_PPM         = -20_000;   //                      -2%
 	parameter integer U2_PPM         = 0;
+	parameter integer U3_PPM         = 15_000;    //                      +1.5%
+	parameter integer PI_PACKETS     = 80;        // phase D: back-to-back Pi packets on UART3
 
 	localparam real    BIT_NS   = 1000.0 * (1.0 - CAN_PPM * 1.0e-6);
 	localparam real    ppm_abs  = ((CAN_PPM < 0) ? -CAN_PPM : CAN_PPM) * 1.0e-6;
-	localparam integer MAXR     = 2048;            // records tracked per source
-	localparam integer MAXG     = 8192;            // global load numbers
+	localparam integer NSRC     = 6;               // 0 CAN, 1..4 UART0..3, 5 COUNTER
+	localparam integer CNT      = 5;
+	localparam integer MAXR     = 4096;            // records tracked per source
+	localparam real    HB_NS    = 1.0e8;           // heartbeat period, 100 ms
 
 	localparam [7:0] ST_ACK_APPLIED  = 8'h01;
 	localparam [7:0] ST_CTRL_BAD     = 8'h02;
@@ -70,47 +93,54 @@ module can_frame_link_tb;
 	end
 
 	reg  can_rx   = 1'b1;
-	reg  [2:0] urx = 3'b111;
+	reg  [3:0] urx = 4'b1111;
+	reg  p2       = 1'b0;                           // PROBE2, rests low (Pi GPIO5)
 	reg  spi_sck  = 1'b0;
 	reg  spi_cs   = 1'b1;
 	reg  spi_mosi = 1'b0;
 	wire spi_miso;
 
 	top #(
-		.UART0_BAUD(U0_BAUD), .UART1_BAUD(U1_BAUD), .UART2_BAUD(U2_BAUD),
+		.UART0_BAUD(U0_BAUD), .UART1_BAUD(U1_BAUD), .UART2_BAUD(U2_BAUD), .UART3_BAUD(U3_BAUD),
 		.BUF_AW(BUF_AW), .INITIAL_OFFSET(INITIAL_OFFSET)
 	) dut (
 		.clk_12m(clk_12m), .can_rx_pin(can_rx),
 		.uart0_pin(urx[0]), .uart1_pin(urx[1]), .uart2_pin(urx[2]),
+		.probe1_pin(urx[3]), .probe2_pin(p2),
 		.spi_sck(spi_sck), .spi_cs(spi_cs), .spi_mosi(spi_mosi), .spi_miso(spi_miso)
 	);
 
 	integer errors = 0;
-	integer esp_fd = 0;                             // +esp=<file>: P/C/U vectors
+	integer esp_fd = 0;                             // +esp=<file>: P/C/U/E vectors
 	integer HALF   = 500;                           // ns: 1 MHz SCK
 	integer RL     = READ_LEN;                      // read length the ESP model uses
 	real    t_por  = 0.0;
+	reg     por_seen = 1'b0;
+	real    t_drain_chk = 0.0;                      // when drain() last found everything drained
 
 	// ------------------------------------------------------------------
-	// Expected records per source (0 = CAN, 1..3 = UART chan 0..2).
-	// Content is built by the transmitters; the timestamp and the global
-	// load number are filled in when the DUT loads its holding slot.
+	// Expected records per source (0 = CAN, 1..4 = UART chan 0..3,
+	// 5 = COUNTER).  Content is built by the transmitters (the counter record
+	// entirely, timestamp included, by the PROBE2 model); the CAN/UART
+	// timestamp and the global load number are filled in when the DUT loads
+	// its holding slot.
 	// ------------------------------------------------------------------
-	reg [7:0]  exp_rec [0:3][0:MAXR-1][0:19];
-	reg [31:0] exp_ts  [0:3][0:MAXR-1];
-	real       exp_t0  [0:3][0:MAXR-1];   // tb time the record's timestamp refers to
-	integer    exp_seq [0:3][0:MAXR-1];
-	integer    n_exp   [0:3];             // records the transmitter produced
-	integer    n_load  [0:3];             // records the DUT loaded into its slot
-	integer    n_rx    [0:3];             // next record expected at the MCU
+	reg [7:0]  exp_rec [0:NSRC-1][0:MAXR-1][0:19];
+	reg [31:0] exp_ts  [0:NSRC-1][0:MAXR-1];
+	real       exp_t0  [0:NSRC-1][0:MAXR-1];   // tb time the record's timestamp refers to
+	real       exp_tl  [0:NSRC-1][0:MAXR-1];   // tb time the DUT loaded it
+	integer    exp_seq [0:NSRC-1][0:MAXR-1];
+	integer    n_exp   [0:NSRC-1];             // records the transmitter produced
+	integer    n_load  [0:NSRC-1];             // records the DUT loaded into its slot
+	integer    n_rx    [0:NSRC-1];             // next record expected at the MCU
 	integer    gseq    = 0;
 	real       can_sof_t [0:MAXR-1];
 	integer    n_sof   = 0;
 	integer    k0;
-	initial for (k0 = 0; k0 < 4; k0 = k0 + 1) begin n_exp[k0] = 0; n_load[k0] = 0; n_rx[k0] = 0; end
+	initial for (k0 = 0; k0 < NSRC; k0 = k0 + 1) begin n_exp[k0] = 0; n_load[k0] = 0; n_rx[k0] = 0; end
 
 	function integer rec_len_of(input integer src);
-		rec_len_of = (src == 0) ? 20 : 8;
+		rec_len_of = (src == 0) ? 20 : (src == CNT) ? 12 : 8;
 	endfunction
 
 	// CAN SOF time (mirror of the RTL latch condition).
@@ -122,23 +152,40 @@ module can_frame_link_tb;
 
 	// Number slot loads in the order the DUT performs them.
 	integer s;
+	real    hb_err;
 	always @(posedge clk_12m) begin
-		for (s = 0; s < 4; s = s + 1)
+		for (s = 0; s < NSRC; s = s + 1)
 			if (dut.load[s]) begin
 				if (n_load[s] >= n_exp[s]) begin
-					$display("FAIL: source %0d loaded a record the testbench never sent", s);
+					$display("FAIL: source %0d loaded a record the testbench never sent (t = %0.3f ms)", s, $realtime / 1e6);
 					errors = errors + 1;
 				end else begin
 					exp_seq[s][n_load[s]] = gseq;
-					exp_ts[s][n_load[s]]  = (s == 0) ? dut.ts_latch :
-					                        (s == 1) ? dut.u_uart0.ts :
-					                        (s == 2) ? dut.u_uart1.ts : dut.u_uart2.ts;
+					exp_tl[s][n_load[s]]  = $realtime;
+					case (s)
+						0: exp_ts[s][n_load[s]] = dut.ts_latch;
+						1: exp_ts[s][n_load[s]] = dut.u_uart0.ts;
+						2: exp_ts[s][n_load[s]] = dut.u_uart1.ts;
+						3: exp_ts[s][n_load[s]] = dut.u_uart2.ts;
+						4: exp_ts[s][n_load[s]] = dut.u_uart3.ts;
+						default: begin
+							// Counter: content predicted by the model.  Heartbeat
+							// period: the k-th record must load within 1 us of
+							// t_por + k * 100 ms (k = n_load + 1).
+							exp_ts[s][n_load[s]] = dut.us_ctr;
+							hb_err = $realtime - (t_por + (n_load[s] + 1) * HB_NS);
+							if (hb_err < 0.0 || hb_err > 1000.0) begin
+								$display("FAIL: counter record %0d loaded %0.1f ns from its 100 ms boundary", n_load[s], hb_err);
+								errors = errors + 1;
+							end
+						end
+					endcase
 					if (s == 0) exp_t0[0][n_load[0]] = can_sof_t[(n_sof - 1) % MAXR];
 				end
 				n_load[s] = n_load[s] + 1;
 				gseq = gseq + 1;
 			end
-		if (dut.overrun != 4'd0) begin
+		if (dut.overrun != 6'd0) begin
 			$display("FAIL: holding slot overrun %b", dut.overrun); errors = errors + 1;
 		end
 		if (dut.u_link.rec_req && dut.u_link.rec_busy) begin
@@ -154,7 +201,8 @@ module can_frame_link_tb;
 	end
 
 	// Records as the DUT pushes them, captured at the SPRAM write port
-	// (C = 20-byte CAN, U = 8-byte UART), for the ESP replay file.
+	// (C = 20-byte CAN, U = 8-byte UART, E = 12-byte edge counter), for the
+	// ESP replay file.
 	reg [7:0] push_b [0:19];
 	integer   push_n = 0, pq;
 	always @(posedge clk_12m)
@@ -164,8 +212,9 @@ module can_frame_link_tb;
 			if (dut.u_link.w_idx == dut.u_link.w_len - 1) begin
 				push_n = push_n + 1;
 				if (esp_fd != 0) begin
-					if (dut.u_link.w_len == 10) $fwrite(esp_fd, "C");   // (a ternary of strings
-					else                        $fwrite(esp_fd, "U");   //  prints as a number)
+					if (dut.u_link.w_len == 10)     $fwrite(esp_fd, "C");   // (a ternary of strings
+					else if (dut.u_link.w_len == 6) $fwrite(esp_fd, "E");   //  prints as a number)
+					else                            $fwrite(esp_fd, "U");
 					for (pq = 0; pq < 2 * dut.u_link.w_len; pq = pq + 1) $fwrite(esp_fd, " %02x", push_b[pq]);
 					$fwrite(esp_fd, "\n");
 				end
@@ -276,15 +325,16 @@ module can_frame_link_tb;
 	// UART transmitters.  kind: 0 normal, 1 framing error (stop bit low),
 	// 2 break (line low for 2.5 frames).
 	// ------------------------------------------------------------------
-	reg [31:0] ulfsr [0:2];
-	initial begin ulfsr[0] = 32'h00C0FFEE; ulfsr[1] = 32'h0BADCAFE; ulfsr[2] = 32'h5EED1234; end
+	reg [31:0] ulfsr [0:3];
+	initial begin ulfsr[0] = 32'h00C0FFEE; ulfsr[1] = 32'h0BADCAFE; ulfsr[2] = 32'h5EED1234; ulfsr[3] = 32'h7E57D00D; end
 
 	function real ubit_ns(input integer ch);
 		begin
 			case (ch)
 				0: ubit_ns = 1.0e9 / U0_BAUD / (1.0 + U0_PPM * 1.0e-6);
 				1: ubit_ns = 1.0e9 / U1_BAUD / (1.0 + U1_PPM * 1.0e-6);
-				default: ubit_ns = 1.0e9 / U2_BAUD / (1.0 + U2_PPM * 1.0e-6);
+				2: ubit_ns = 1.0e9 / U2_BAUD / (1.0 + U2_PPM * 1.0e-6);
+				default: ubit_ns = 1.0e9 / U3_BAUD / (1.0 + U3_PPM * 1.0e-6);
 			endcase
 		end
 	endfunction
@@ -333,6 +383,186 @@ module can_frame_link_tb;
 		end
 	endtask
 
+	// Pi P1.9 stream (CONTRACT §7.3): 'P' 'B' | seq u32 LE | t_ms u32 LE |
+	// xorshift32(seq) u32 LE | CRC-16/CCITT-FALSE over bytes 0-13, LE.
+	integer pi_seq = 0;
+	function [31:0] xorshift32(input [31:0] x0);
+		reg [31:0] x;
+		begin
+			x = x0;
+			x = x ^ (x << 13);
+			x = x ^ (x >> 17);
+			x = x ^ (x << 5);
+			xorshift32 = x;
+		end
+	endfunction
+
+	task automatic pi_packets(input integer npk, input integer gap_bytes);
+		integer p, i;
+		reg [7:0]  b [0:15];
+		reg [31:0] t_ms, pat;
+		reg [15:0] c;
+		begin
+			for (p = 0; p < npk; p = p + 1) begin
+				t_ms = $realtime / 1.0e6;
+				pat  = xorshift32(pi_seq);
+				b[0] = 8'h50; b[1] = 8'h42;
+				for (i = 0; i < 4; i = i + 1) begin
+					b[2 + i]  = pi_seq >> (8 * i);
+					b[6 + i]  = t_ms   >> (8 * i);
+					b[10 + i] = pat    >> (8 * i);
+				end
+				c = 16'hFFFF;
+				for (i = 0; i < 14; i = i + 1) c = tb_crc(c, b[i]);
+				b[14] = c[7:0]; b[15] = c[15:8];
+				for (i = 0; i < 16; i = i + 1) uart_send(3, b[i], 0);
+				pi_seq = pi_seq + 1;
+				#(gap_bytes * 10.0 * ubit_ns(3));
+			end
+		end
+	endtask
+
+	// ------------------------------------------------------------------
+	// PROBE2 source and the testbench's own counter model.  Every pin
+	// change goes through p2_guard so that nothing is in flight within
+	// 8 us before / 3 us after a heartbeat boundary: the snapshot taken
+	// 2 us before the boundary is then exactly what the DUT must report.
+	// ------------------------------------------------------------------
+	integer tb_rise = 0, tb_glw = 0, tb_gl_total = 0, tb_bursts = 0;
+	reg     tb_lvl  = 1'b0;
+	reg [31:0] plfsr = 32'h0DDBA11F;
+	function [31:0] prnd(input dummy);
+		begin
+			plfsr = {plfsr[30:0], plfsr[31] ^ plfsr[21] ^ plfsr[1] ^ plfsr[0]};
+			prnd  = plfsr;
+		end
+	endfunction
+
+	function real hb_phase(input dummy);
+		real e;
+		begin
+			e = $realtime - t_por;
+			hb_phase = e - HB_NS * $floor(e / HB_NS);
+		end
+	endfunction
+
+	task p2_guard;
+		real ph;
+		begin
+			ph = hb_phase(0);
+			if (ph > HB_NS - 8000.0) #(HB_NS - ph + 3000.0);
+			else if (ph < 3000.0)    #(3000.0 - ph);
+		end
+	endtask
+
+	task p2_set(input v);              // a real (filter-accepted) level change
+		begin
+			p2_guard;
+			p2 = v;
+			if (v && !tb_lvl) tb_rise = tb_rise + 1;
+			tb_lvl = v;
+		end
+	endtask
+
+	task p2_glitch(input real w);      // excursion of w ns (100..850) away from the level, then back
+		begin
+			p2_guard;
+			p2 = ~tb_lvl;  #(w);
+			p2 = tb_lvl;   #(150.0);
+			tb_glw = tb_glw + 1;
+			tb_gl_total = tb_gl_total + 1;
+		end
+	endtask
+
+	function real gw(input dummy);     // glitch width 100..850 ns
+		gw = 100.0 + (prnd(0) % 751);
+	endfunction
+
+	// n rising edges, hi/lo ns per half; every gl_every-th period gets a glitch
+	// in the middle of its high half and of its low half (0 = none).
+	task p2_burst(input integer n, input real hi, input real lo, input integer gl_every);
+		integer i;
+		begin
+			for (i = 0; i < n; i = i + 1) begin
+				p2_set(1'b1);
+				if (gl_every != 0 && i % gl_every == gl_every - 1) begin
+					#(hi / 2.0); p2_glitch(gw(0)); #(hi / 2.0);
+				end else #(hi);
+				p2_set(1'b0);
+				if (gl_every != 0 && i % gl_every == gl_every - 1) begin
+					#(lo / 2.0); p2_glitch(gw(0)); #(lo / 2.0);
+				end else #(lo);
+			end
+			tb_bursts = tb_bursts + 1;
+		end
+	endtask
+
+	// Heartbeat model: snapshot 2 us before each boundary (no stimulus then).
+	integer hb_k = 0, hb_n;
+	always begin : hb_model
+		wait (por_seen);
+		hb_k = hb_k + 1;
+		#(t_por + hb_k * HB_NS - 2000.0 - $realtime);
+		hb_n = n_exp[CNT];
+		if (hb_n != hb_k - 1) begin
+			$display("FAIL: heartbeat model out of step"); errors = errors + 1;
+		end
+		exp_rec[CNT][hb_n][0]  = 8'hE7;
+		exp_rec[CNT][hb_n][1]  = {tb_lvl, 7'b000_0000};
+		exp_rec[CNT][hb_n][2]  = tb_rise >> 24;
+		exp_rec[CNT][hb_n][3]  = tb_rise >> 16;
+		exp_rec[CNT][hb_n][4]  = tb_rise >> 8;
+		exp_rec[CNT][hb_n][5]  = tb_rise;
+		exp_rec[CNT][hb_n][6]  = (hb_k * 100000) >> 24;
+		exp_rec[CNT][hb_n][7]  = (hb_k * 100000) >> 16;
+		exp_rec[CNT][hb_n][8]  = (hb_k * 100000) >> 8;
+		exp_rec[CNT][hb_n][9]  = (hb_k * 100000);
+		exp_rec[CNT][hb_n][10] = (tb_glw > 255) ? 8'd255 : tb_glw;
+		exp_rec[CNT][hb_n][11] = 8'h7E;
+		exp_ts[CNT][hb_n]      = hb_k * 100000;
+		exp_t0[CNT][hb_n]      = t_por + hb_k * HB_NS;
+		tb_glw = 0;
+		n_exp[CNT] = hb_n + 1;
+	end
+
+	integer sat_done = 0;
+	initial begin : probe2_stim
+		integer j;
+		wait (por_seen);
+		#(30_000);
+		p2_burst(37, 10_000, 10_000, 5);                 // 37 edges, glitches in both levels
+		for (j = 0; j < 12; j = j + 1) begin             // idle glitches
+			#(20_000 + (prnd(0) % 180_000));
+			p2_glitch(gw(0));
+		end
+		p2_burst(1000, 10_000, 10_000, 97);              // 1000 edges at 50 kHz (Pi: 1000 at 500 Hz)
+		#(200_000);
+		for (j = 0; j < 20; j = j + 1) begin             // contact bounce before each rising edge
+			p2_glitch(300.0); #(300.0);
+			p2_set(1'b1); #(5_000);
+			p2_set(1'b0); #(5_000);
+		end
+		tb_bursts = tb_bursts + 1;
+		p2_burst(200, 1_500, 1_500, 0);                  // 18-clock halves: accepted
+		// Saturation: 300 glitches inside one heartbeat window.
+		wait (n_load[CNT] >= 1);
+		#(10_000);
+		for (j = 0; j < 300; j = j + 1) begin p2_glitch(400.0); #(250.0); end
+		sat_done = 1;
+		// Level 1 across a boundary (the record's level bit), with glitches low.
+		#(1_000_000);
+		p2_set(1'b1);
+		for (j = 0; j < 5; j = j + 1) begin #(25_000_000); p2_glitch(gw(0)); end
+		#(10_000_000);
+		p2_set(1'b0);
+		forever begin                                    // random bursts and gaps
+			#(2_000_000 + (prnd(0) % 8_000_000));
+			p2_burst(1 + (prnd(0) % 200), 2_000 + (prnd(0) % 18_000), 2_000 + (prnd(0) % 18_000),
+			         (prnd(0) % 4 != 0) ? 0 : 25 + (prnd(0) % 40));
+			if (prnd(0) % 2) begin #(50_000); p2_glitch(gw(0)); end
+		end
+	end
+
 	// ------------------------------------------------------------------
 	// MCU model
 	// ------------------------------------------------------------------
@@ -364,13 +594,15 @@ module can_frame_link_tb;
 
 	integer    drops_ok   = 0;
 	integer    recs_ok    = 0;
-	integer    recs_by    [0:3];
+	integer    recs_by    [0:NSRC-1];
 	integer    gaps_total = 0;             // records missing in the global numbering
 	integer    last_seq   = -1;
 	integer    dup_samp   = 0;
 	integer    split_recs = 0;             // records that straddled two frames
 	integer    n_fe = 0, n_brk = 0;
-	initial for (k0 = 0; k0 < 4; k0 = k0 + 1) recs_by[k0] = 0;
+	integer    cnt_sat = 0, cnt_glitch = 0, cnt_lvl1 = 0;   // delivered counter records: glitch=255, sum, level=1
+	reg [31:0] cnt_rise = 0;
+	initial for (k0 = 0; k0 < NSRC; k0 = k0 + 1) recs_by[k0] = 0;
 
 	integer dump_fd = 0, rec_fd = 0, dumping = 0;
 	reg [8*256-1:0] fname;
@@ -429,7 +661,7 @@ module can_frame_link_tb;
 		reg       flag;
 		real      tsu;
 		begin
-			flagpos = (src == 0) ? 6 : 1;
+			flagpos = (src == 0) ? 6 : 1;          // CAN byte 6 bit 7; UART/COUNTER byte 1 bit 3
 			match = -1;
 			for (j = n_rx[src]; j < n_load[src] && match < 0 && (j == n_rx[src] || drops_ok); j = j + 1) begin
 				match = j;
@@ -437,7 +669,7 @@ module can_frame_link_tb;
 					g = sbuf[(s_head + i) & 16'hFFFF];
 					e = exp_rec[src][j][i];
 					if (src == 0 && i >= 15 && i <= 18) e = exp_ts[0][j][8 * (18 - i) +: 8];
-					if (src != 0 && i >= 3 && i <= 6)   e = exp_ts[src][j][8 * (6 - i) +: 8];
+					if (src != 0 && src != CNT && i >= 3 && i <= 6) e = exp_ts[src][j][8 * (6 - i) +: 8];
 					if (i == flagpos) e = (src == 0) ? {g[7], e[6:0]} : {e[7:4], g[3], e[2:0]};
 					if (g !== e) match = -1;
 				end
@@ -449,7 +681,8 @@ module can_frame_link_tb;
 				for (i = 0; i < len; i = i + 1) $write("%02x ", sbuf[(s_head + i) & 16'hFFFF]);
 				$write("\n   exp ");
 				for (i = 0; i < len; i = i + 1) $write("%02x ", exp_rec[src][n_rx[src]][i]);
-				$write("(timestamp bytes from the DUT latch)\n");
+				if (src == CNT) $write("(predicted by the PROBE2 model)\n");   // (no string ternary:
+				else            $write("(timestamp bytes from the DUT latch)\n");   //  iverilog prints a number)
 				errors = errors + 1;
 				n_rx[src] = n_rx[src] + 1;
 			end else begin
@@ -485,9 +718,19 @@ module can_frame_link_tb;
 					$display("FAIL [%0s]: source %0d timestamp %0d, elapsed %0.1f", label, src, exp_ts[src][match], tsu);
 					errors = errors + 1;
 				end
-				if (src != 0) begin
+				if (src != 0 && src != CNT) begin
 					if (exp_rec[src][match][1][5]) n_fe  = n_fe + 1;
 					if (exp_rec[src][match][1][4]) n_brk = n_brk + 1;
+				end
+				if (src == CNT) begin
+					if (exp_ts[CNT][match] != (match + 1) * 100000) begin
+						$display("FAIL [%0s]: counter record %0d timestamp %0d us", label, match, exp_ts[CNT][match]);
+						errors = errors + 1;
+					end
+					if (exp_rec[CNT][match][10] == 8'd255) cnt_sat = cnt_sat + 1;
+					if (exp_rec[CNT][match][1][7])         cnt_lvl1 = cnt_lvl1 + 1;
+					cnt_glitch = cnt_glitch + exp_rec[CNT][match][10];
+					cnt_rise   = {exp_rec[CNT][match][2], exp_rec[CNT][match][3], exp_rec[CNT][match][4], exp_rec[CNT][match][5]};
 				end
 				if (rec_fd != 0) begin
 					$fwrite(rec_fd, "R %0d %0d", src, match);
@@ -516,6 +759,7 @@ module can_frame_link_tb;
 				else begin
 					m = sbuf[s_head & 16'hFFFF];
 					if (m == 8'hAA) begin len = 20; src = 0; end
+					else if (m == 8'hE7) begin len = 12; src = CNT; end
 					else if (m == 8'hC5) begin
 						len = 8;
 						src = (avail >= 2) ? sbuf[(s_head + 1) & 16'hFFFF][7:6] + 1 : 1;
@@ -527,11 +771,7 @@ module can_frame_link_tb;
 					end
 					if (len != 0) begin
 						if (avail < len) done = 1;            // rest arrives in the next frame
-						else if (src > 3) begin
-							$display("FAIL [%0s]: UART record with reserved channel 3", label);
-							errors = errors + 1;
-							s_head = s_head + len;
-						end else
+						else
 							check_record(src, len, label);
 					end
 				end
@@ -640,8 +880,20 @@ module can_frame_link_tb;
 			// Everything sent has reached a holding slot; the rest is checked by
 			// the buffer/stream conditions in drain().  (n_rx cannot be used:
 			// a source's last records may legitimately be dropped.)
-			for (q = 0; q < 4; q = q + 1)
+			for (q = 0; q < NSRC; q = q + 1)
 				if (n_load[q] < n_exp[q]) all_done = 0;
+		end
+	endfunction
+
+	// Counter records loaded after drain() last found the DUT empty and not
+	// yet delivered: the heartbeat never stops, so one may be in flight when
+	// a phase ends.  Only those are excused from the per-phase accounting.
+	function integer cnt_in_flight(input dummy);
+		integer j;
+		begin
+			cnt_in_flight = 0;
+			for (j = n_rx[CNT]; j < n_load[CNT]; j = j + 1)
+				if (exp_tl[CNT][j] >= t_drain_chk) cnt_in_flight = cnt_in_flight + 1;
 		end
 	endfunction
 
@@ -653,9 +905,10 @@ module can_frame_link_tb;
 				poll(RL, label);
 				guard = guard + 1;
 			end
+			t_drain_chk = $realtime;
 			poll(RL, label);
-			for (q = 0; q < 4; q = q + 1)
-				if (!drops_ok && n_rx[q] != n_exp[q]) begin
+			for (q = 0; q < NSRC; q = q + 1)
+				if (!drops_ok && n_rx[q] + ((q == CNT) ? cnt_in_flight(0) + (n_exp[CNT] - n_load[CNT]) : 0) != n_exp[q]) begin
 					$display("FAIL [%0s]: source %0d: %0d of %0d records accounted for", label, q, n_rx[q], n_exp[q]);
 					errors = errors + 1;
 				end
@@ -708,7 +961,7 @@ module can_frame_link_tb;
 	// ------------------------------------------------------------------
 	// Tests
 	// ------------------------------------------------------------------
-	integer i, k, gaps_before, sent_before;
+	integer i, k, gaps_before, sent_before, a_cnt_before, d_u3_before, d_cnt_before, c_ld4, c_ld5, c_rx4, c_rx5, infl;
 	reg [8*9-1:0] check_str;
 	reg [15:0] c16;
 
@@ -722,15 +975,16 @@ module can_frame_link_tb;
 		if ($value$plusargs("esp=%s", fname))     esp_fd  = $fopen(fname, "w");
 		if (esp_fd != 0) begin
 			$fwrite(esp_fd, "# can_frame_link_tb vectors for test_link_records.c replay_vectors().\n");
-			$fwrite(esp_fd, "# C/U = records exactly as the DUT wrote them into the link buffer (push order),\n");
-			$fwrite(esp_fd, "# captured at the SPRAM write port.  P = payload bytes of each valid frame as the\n");
-			$fwrite(esp_fd, "# MCU accepts them (resent samples removed), in stream order.\n");
+			$fwrite(esp_fd, "# C/U/E = records exactly as the DUT wrote them into the link buffer (push order),\n");
+			$fwrite(esp_fd, "# captured at the SPRAM write port: C = 20-byte CAN (0xAA), U = 8-byte UART (0xC5,\n");
+			$fwrite(esp_fd, "# chan 0-3), E = 12-byte PROBE2 edge-counter record (0xE7).  P = payload bytes of\n");
+			$fwrite(esp_fd, "# each valid frame as the MCU accepts them (resent samples removed), in stream order.\n");
 		end
 
 		$display("=== can_frame_link testbench: BUF_AW=%0d, offsets from %08x, CAN %0d ppm, read_len %0d ===",
 		         BUF_AW, INITIAL_OFFSET, CAN_PPM, READ_LEN);
-		$display("    UART0 %0d baud (tx %+0d ppm), UART1 %0d baud (tx %+0d ppm), UART2 %0d baud (tx %+0d ppm)",
-		         U0_BAUD, U0_PPM, U1_BAUD, U1_PPM, U2_BAUD, U2_PPM);
+		$display("    UART0 %0d baud (tx %+0d ppm), UART1 %0d baud (tx %+0d ppm), UART2 %0d baud (tx %+0d ppm), UART3 %0d baud (tx %+0d ppm)",
+		         U0_BAUD, U0_PPM, U1_BAUD, U1_PPM, U2_BAUD, U2_PPM, U3_BAUD, U3_PPM);
 
 		check_str = "123456789";
 		c16 = 16'hFFFF;
@@ -739,9 +993,12 @@ module can_frame_link_tb;
 
 		wait (dut.por[7]);
 		t_por = $realtime;
+		por_seen = 1'b1;
 		#(20 * BIT_NS);
 
-		// -- A: CAN + three UART channels concurrently, MCU polling --------
+		// -- A: CAN + four UART channels + PROBE2 concurrently, MCU polling --
+		//    (runs past the first heartbeat so the phase-A vectors hold a
+		//    counter record)
 		dumping = 1;
 		polling = 1'b1;
 		fork
@@ -754,23 +1011,35 @@ module can_frame_link_tb;
 			uart_script(0, 16, 5, -1, 9);        // framing error, genuine 0x00
 			uart_script(1, 20, -1, 12, 3);       // break, genuine 0x00
 			uart_script(2, 12, 8, 4, -1);        // break and framing error
+			begin                                // UART3: Pi packets, then errors at 115200
+				#(5_000_000);
+				pi_packets(4, 20);
+				#(5_000_000);
+				uart_script(3, 12, 4, 8, 2);     // framing error, break, genuine 0x00
+				pi_packets(2, 0);
+			end
+			wait (n_load[CNT] >= 1);
 		join
 		stop_poller;
 		drain("A drain");
 		dumping = 0;
 		$display("  [t = %0.1f ms]", $realtime / 1e6);
-		$display("  A: CAN %0d, UART0 %0d, UART1 %0d, UART2 %0d records delivered (%0d framing errors, %0d breaks), %0d straddled frames, %0d dropped",
-		         recs_by[0], recs_by[1], recs_by[2], recs_by[3], n_fe, n_brk, split_recs, gaps_total);
+		$display("  A: CAN %0d, UART0 %0d, UART1 %0d, UART2 %0d, UART3 %0d, COUNTER %0d records delivered (%0d framing errors, %0d breaks), %0d straddled frames, %0d dropped",
+		         recs_by[0], recs_by[1], recs_by[2], recs_by[3], recs_by[4], recs_by[5], n_fe, n_brk, split_recs, gaps_total);
 		if (gaps_total != 0 || dut.u_link.dropped != 0) begin
 			$display("FAIL [A]: records dropped while the MCU was keeping up"); errors = errors + 1;
 		end
+		for (k = 0; k < NSRC; k = k + 1)
+			if (recs_by[k] == 0) begin
+				$display("FAIL [A]: source %0d delivered no records (empty compare)", k); errors = errors + 1;
+			end
 		if (n_inj[1] != 1 || n_inj[2] != 1 || n_inj[3] != 1) begin
 			$display("FAIL [A]: fault injections ran %0d/%0d/%0d times, expected 1 each", n_inj[1], n_inj[2], n_inj[3]);
 			errors = errors + 1;
 		end else
 			$display("  A: survived 1 corrupt control block, 1 corrupt MISO frame, 1 aborted transfer mid-stream");
 
-		// -- B: SCK sweep, CAN + UART0 -----------------------------------
+		// -- B: SCK sweep, CAN + UART0 + UART3 -----------------------------
 		for (k = 0; k < 4; k = k + 1) begin
 			case (k)
 				0: HALF = 1250;   // 400 kHz
@@ -782,6 +1051,7 @@ module can_frame_link_tb;
 			fork
 				send_mix(8, -1, 2);
 				uart_script(0, 4, -1, -1, -1);
+				uart_script(3, 6, (k == 1) ? 1 : -1, (k == 2) ? 2 : -1, (k == 3) ? 0 : -1);
 			join
 			stop_poller;
 			drain("B sweep");
@@ -794,6 +1064,7 @@ module can_frame_link_tb;
 		fork
 			send_mix(6, -1, 0);
 			uart_script(2, 3, -1, -1, -1);
+			pi_packets(1, 0);
 		join
 		stop_poller;
 		drain("B2 straddle");
@@ -806,28 +1077,44 @@ module can_frame_link_tb;
 		$display("  B: SCK 400 kHz / 750 kHz / 1.2 MHz / 1.5 MHz: %0d records delivered so far, all exact", recs_ok);
 
 		// -- C: overflow (small buffer only): the MCU stops reading ---------
+		//    Held until a heartbeat has been loaded while stopped, so CAN,
+		//    UART3 and COUNTER records are all among the dropped.
 		if (BUF_AW <= 10) begin
 			gaps_before = gaps_total;
-			sent_before = n_exp[0] + n_exp[1] + n_exp[2] + n_exp[3];
+			sent_before = n_exp[0] + n_exp[1] + n_exp[2] + n_exp[3] + n_exp[4] + n_exp[5];
+			c_ld4 = n_load[4]; c_ld5 = n_load[5]; c_rx4 = recs_by[4]; c_rx5 = recs_by[5];
 			drops_ok = 1;
 			fork
 				send_mix(120, -1, 0);
 				uart_script(0, 20, -1, -1, -1);
 				uart_script(2, 10, -1, -1, -1);
+				begin #(2_000_000); pi_packets(6, 0); end
+				begin : c_hb
+					integer want;
+					want = n_load[CNT] + 1;
+					wait (n_load[CNT] >= want);
+				end
 			join
 			drain("C drain");
+			infl = cnt_in_flight(0);
 			// Missing = loaded but never delivered (includes drops after the
 			// last delivered record, which no later record has flagged yet).
-			if (gseq - recs_ok == gaps_before) begin
+			if (gseq - infl - recs_ok == gaps_before) begin
 				$display("FAIL [C]: buffer overflowed but nothing was dropped"); errors = errors + 1;
 			end
-			if (fr_dropped !== gseq - recs_ok) begin
-				$display("FAIL [C]: header reports %0d records dropped, %0d missing", fr_dropped, gseq - recs_ok);
+			if (fr_dropped !== gseq - infl - recs_ok) begin
+				$display("FAIL [C]: header reports %0d records dropped, %0d missing", fr_dropped, gseq - infl - recs_ok);
 				errors = errors + 1;
 			end
 			$display("  [t = %0.1f ms]", $realtime / 1e6);
-			$display("  C: overflow: %0d of %0d records dropped whole (header dropped = %0d records)",
-			         gseq - recs_ok - gaps_before, n_exp[0] + n_exp[1] + n_exp[2] + n_exp[3] - sent_before, fr_dropped);
+			$display("  C: overflow: %0d of %0d records dropped whole (header dropped = %0d records); UART3 %0d of %0d and COUNTER %0d of %0d loaded during C were dropped",
+			         gseq - infl - recs_ok - gaps_before,
+			         n_exp[0] + n_exp[1] + n_exp[2] + n_exp[3] + n_exp[4] + n_exp[5] - sent_before, fr_dropped,
+			         (n_load[4] - c_ld4) - (recs_by[4] - c_rx4), n_load[4] - c_ld4,
+			         (n_load[5] - c_ld5 - infl) - (recs_by[5] - c_rx5), n_load[5] - c_ld5 - infl);
+			if ((n_load[4] - c_ld4) - (recs_by[4] - c_rx4) == 0 || (n_load[5] - c_ld5 - infl) - (recs_by[5] - c_rx5) == 0) begin
+				$display("FAIL [C]: overflow did not drop at least one UART3 and one COUNTER record"); errors = errors + 1;
+			end
 			// Recovery: the first new record must carry dropped=1 if the drops
 			// were trailing; drops stay allowed until it has been checked.
 			polling = 1'b1;
@@ -837,6 +1124,13 @@ module can_frame_link_tb;
 			join
 			stop_poller;
 			drain("C after");
+			// The DUT is empty now, so a record loaded but never delivered (and
+			// not a counter record loaded after the drain check) was dropped; the
+			// global numbering has already charged it to gaps_total.  Move each
+			// source past its trailing drops, so later phases match exactly.
+			infl = cnt_in_flight(0);
+			for (k = 0; k < NSRC; k = k + 1)
+				n_rx[k] = n_load[k] - ((k == CNT) ? infl : 0);
 			drops_ok = 0;
 			if (gaps_total != fr_dropped) begin
 				$display("FAIL [C]: %0d records missing in the delivered sequence, header says %0d", gaps_total, fr_dropped);
@@ -846,18 +1140,52 @@ module can_frame_link_tb;
 		end else
 			$display("  C: overflow skipped (buffer too large to fill in simulation)");
 
+		// -- D: the home-run load: Pi packets back to back on UART3 with the
+		//    PROBE2 bursts and heartbeats running, MCU polling; no drops.
+		gaps_before  = gaps_total;
+		d_u3_before  = recs_by[4];
+		d_cnt_before = recs_by[5];
+		polling = 1'b1;
+		fork
+			pi_packets(PI_PACKETS, 0);
+			wait (sat_done);
+		join
+		stop_poller;
+		drain("D drain");
+		$display("  [t = %0.1f ms]", $realtime / 1e6);
+		$display("  D: %0d Pi packets back to back at %0d baud: %0d UART3 records, %0d COUNTER records delivered, %0d dropped",
+		         PI_PACKETS, U3_BAUD, recs_by[4] - d_u3_before, recs_by[5] - d_cnt_before, gaps_total - gaps_before);
+		if (gaps_total != gaps_before) begin
+			$display("FAIL [D]: records dropped while the MCU was keeping up"); errors = errors + 1;
+		end
+		if (recs_by[4] - d_u3_before < 16 * PI_PACKETS || recs_by[5] == d_cnt_before) begin
+			$display("FAIL [D]: expected >= %0d UART3 and > 0 COUNTER records", 16 * PI_PACKETS); errors = errors + 1;
+		end
+
 		// -- Totals --------------------------------------------------------
-		for (k = 0; k < 4; k = k + 1)
-			if (n_load[k] != n_exp[k]) begin
+		infl = cnt_in_flight(0);
+		for (k = 0; k < NSRC; k = k + 1) begin
+			if (n_load[k] != n_exp[k] && !(k == CNT && n_exp[k] - n_load[k] == 1)) begin
 				$display("FAIL: source %0d: DUT loaded %0d records, testbench sent %0d", k, n_load[k], n_exp[k]);
 				errors = errors + 1;
 			end
-		if (recs_ok + gaps_total != gseq) begin
-			$display("FAIL: %0d delivered + %0d dropped != %0d records", recs_ok, gaps_total, gseq);
+			if (recs_by[k] == 0) begin
+				$display("FAIL: source %0d delivered no records (empty compare)", k);
+				errors = errors + 1;
+			end
+		end
+		if (recs_ok + gaps_total + infl != gseq) begin
+			$display("FAIL: %0d delivered + %0d dropped + %0d in flight != %0d records", recs_ok, gaps_total, infl, gseq);
 			errors = errors + 1;
 		end
-		$display("  totals: %0d records (%0d CAN, %0d/%0d/%0d UART0/1/2) delivered exactly once in arrival order, %0d dropped (all reported), %0d duplicate samples skipped",
-		         recs_ok, recs_by[0], recs_by[1], recs_by[2], recs_by[3], gaps_total, dup_samp);
+		if (cnt_sat == 0) begin
+			$display("FAIL: no counter record reported a saturated glitch count"); errors = errors + 1;
+		end
+		if (cnt_lvl1 == 0 || cnt_lvl1 == recs_by[CNT]) $display("  note: counter level bit seen only as %0d", cnt_lvl1 != 0);
+		$display("  counter: %0d records (period 100 ms exact), rise %0d at the last delivered (tb drove %0d edges in %0d bursts), glitch sum %0d (tb injected %0d), %0d saturated at 255, %0d with level=1, %0d in flight at end",
+		         recs_by[CNT], cnt_rise, tb_rise, tb_bursts, cnt_glitch, tb_gl_total, cnt_sat, cnt_lvl1, infl);
+		$display("  totals: %0d records (%0d CAN, %0d/%0d/%0d/%0d UART0/1/2/3, %0d COUNTER) delivered exactly once in arrival order, %0d dropped (all reported), %0d duplicate samples skipped",
+		         recs_ok, recs_by[0], recs_by[1], recs_by[2], recs_by[3], recs_by[4], recs_by[5], gaps_total, dup_samp);
 
 		if (dump_fd != 0) $fclose(dump_fd);
 		if (esp_fd  != 0) $fclose(esp_fd);
