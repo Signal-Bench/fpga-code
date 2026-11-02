@@ -142,6 +142,7 @@ module can_frame_link_tb;
 	real       can_sof_t [0:MAXR-1];
 	integer    n_sof   = 0;
 	integer    k0;
+	integer    n_lost = 0, lost_expect = 0;   // records the DUT discards (counted as dropped) by design
 	initial for (k0 = 0; k0 < NSRC; k0 = k0 + 1) begin n_exp[k0] = 0; n_load[k0] = 0; n_rx[k0] = 0; end
 
 	function integer rec_len_of(input integer src);
@@ -679,10 +680,10 @@ module can_frame_link_tb;
 	// Requested config for the next send_cfg.
 	reg  [7:0]  rq_gen = 8'd0, rq_mode = 8'd0, rq_spi = 8'd0;
 	reg  [15:0] rq_div [0:3];
-	integer     n_cfg [0:2];                     // C3 transactions: good / bad CRC / out of range
+	integer     n_cfg [0:7];                     // C3 transactions by kind (build_cfg)
 	integer     n_cfg_total = 0;
 	integer     cfg_kind = 0;
-	initial begin n_cfg[0] = 0; n_cfg[1] = 0; n_cfg[2] = 0; end
+	initial for (k0 = 0; k0 < 8; k0 = k0 + 1) n_cfg[k0] = 0;
 	reg [8*256-1:0] fname;
 
 	task build_ctrl(input integer len, input corrupt);
@@ -707,7 +708,10 @@ module can_frame_link_tb;
 	endtask
 
 	// C3 config block (contract §3): C3 gen mode spi_cfg div0..3 (u16 LE) crc16 BE.
-	// kind 0 = valid, 1 = CRC corrupted, 2 = valid CRC but div0 = 15 (out of range).
+	// kind 0 = valid, 1 = CRC low byte corrupted, 2 = div0 = 15, 3 = probe_mode 4,
+	// 4 = spi_cfg bit 3 set (all with a valid CRC), 5 = valid but only 13 bytes
+	// clocked, 6 = valid plus 2 extra bytes (16 clocked: applies, the extra
+	// bytes are ignored), 7 = CRC high byte corrupted.  1-5 and 7 are ignored.
 	task build_cfg(input integer kind);
 		integer i;
 		reg [15:0] c, d0;
@@ -715,8 +719,8 @@ module can_frame_link_tb;
 			d0 = (kind == 2) ? 16'd15 : rq_div[0];
 			mosi_buf[0]  = 8'hC3;
 			mosi_buf[1]  = rq_gen;
-			mosi_buf[2]  = rq_mode;
-			mosi_buf[3]  = rq_spi;
+			mosi_buf[2]  = (kind == 3) ? 8'd4 : rq_mode;
+			mosi_buf[3]  = (kind == 4) ? (rq_spi | 8'h08) : rq_spi;
 			mosi_buf[4]  = d0[7:0];        mosi_buf[5]  = d0[15:8];
 			mosi_buf[6]  = rq_div[1][7:0]; mosi_buf[7]  = rq_div[1][15:8];
 			mosi_buf[8]  = rq_div[2][7:0]; mosi_buf[9]  = rq_div[2][15:8];
@@ -726,6 +730,8 @@ module can_frame_link_tb;
 			mosi_buf[12] = c[15:8];
 			mosi_buf[13] = c[7:0];
 			if (kind == 1) mosi_buf[13] = mosi_buf[13] ^ 8'h40;
+			if (kind == 7) mosi_buf[12] = mosi_buf[12] ^ 8'h01;
+			mosi_buf[14] = 8'hA5; mosi_buf[15] = 8'h5A;   // kind 6 tail
 		end
 	endtask
 
@@ -745,14 +751,14 @@ module can_frame_link_tb;
 			sn_rd = dut.u_link.rd_off; sn_hw = dut.u_link.sent_hw;
 			sn_dr = dut.u_link.dropped_reported; sn_cg = dut.u_link.ctrl_good;
 			build_cfg(kind);
-			xfer(14, -1);
+			xfer((kind == 5) ? 13 : (kind == 6) ? 16 : 14, -1);
 			if (dut.u_link.rd_off !== sn_rd || dut.u_link.sent_hw !== sn_hw ||
 			    dut.u_link.dropped_reported !== sn_dr || dut.u_link.ctrl_good !== sn_cg) begin
 				$display("FAIL: C3 config transaction changed the stream state (rd %08x->%08x hw %08x->%08x)",
 				         sn_rd, dut.u_link.rd_off, sn_hw, dut.u_link.sent_hw);
 				errors = errors + 1;
 			end
-			if (kind == 0) begin
+			if (kind == 0 || kind == 6) begin
 				tb_gen = rq_gen; tb_mode = rq_mode[1:0]; tb_spi = rq_spi[2:0];
 				tb_div[0] = rq_div[0]; tb_div[1] = rq_div[1]; tb_div[2] = rq_div[2]; tb_div[3] = rq_div[3];
 			end
@@ -840,7 +846,9 @@ module can_frame_link_tb;
 					$display("FAIL [%0s]: %0d record(s) missing before load #%0d", label, gap, seq);
 					errors = errors + 1;
 				end
-				if (flag !== (gap > 0)) begin
+				if (flag === 1'b1 && gap == 0 && lost_expect > 0)
+					lost_expect = lost_expect - 1;      // a record the DUT discarded on a mode change
+				else if (flag !== (gap > 0)) begin
 					$display("FAIL [%0s]: dropped flag %0d with %0d record(s) missing before it", label, flag, gap);
 					errors = errors + 1;
 				end
@@ -1131,6 +1139,7 @@ module can_frame_link_tb;
 	integer   n_dio_gl = 0;
 	reg [7:0] spi_pmo = 8'd0, spi_pmi = 8'd0;
 	localparam real SPI_TCO = 100.0;     // SPI data change after the shift edge, ns
+	real      spi_lead = 0.0;            // > 0: CS falls this many ns before the first edge (CPHA 0)
 	function [7:0] dio_pins(input dummy);
 		dio_pins = {p38, p2, urx[3]};
 	endfunction
@@ -1232,11 +1241,14 @@ module can_frame_link_tb;
 			i2c_scl(1'b0); #(IH);
 		end
 	endtask
+	integer i2c_gl_at = -1;              // bit index of the next byte that gets a glitched SCL rise
 	task i2c_byte(input [7:0] d, input ack);
 		integer i;
 		real t9;
 		begin
-			for (i = 7; i >= 0; i = i - 1) i2c_bit(d[i]);
+			for (i = 7; i >= 0; i = i - 1)
+				if (i == i2c_gl_at) i2c_glbit(d[i]); else i2c_bit(d[i]);
+			i2c_gl_at = -1;
 			i2c_pend = -1;                   // the previous byte went out at bit 7's commit
 			i2c_sda(~ack); #(IH);            // ACK slot (driven by the addressed device)
 			i2c_scl(1'b1); #(2 * IH);
@@ -1268,22 +1280,32 @@ module can_frame_link_tb;
 			i2c_sda(1'b0); #(IH);
 			i2c_scl(1'b1); #(IH);
 			i2c_sda(1'b1);
-			push_probe(I2C, {i2c_sf, 6'b110001}, m, 8'h00, 8'h00, $realtime);
+			push_probe(I2C, {i2c_sf, 6'b100001}, m, 8'h00, 8'h00, $realtime);   // stop, partial; data_valid 0
 			i2c_in = 1'b0; i2c_sf = 2'b00;
 			#(4 * IH);
 		end
 	endtask
-	// Bus left idle (SCL low) for 1.3 ms inside a transaction: timeout.
+	// Bus released (SDA then SCL high, no STOP) inside a transaction for 1.3 ms:
+	// timeout (contract §2: SCL and SDA both high > 1 ms).  The lines are then
+	// idle-high, ready for a START.
 	task i2c_timeout;
 		begin
-			// expectation first: the DUT emits 1 ms after the last edge
+			i2c_sda(1'b1); #(IH);
+			i2c_scl(1'b1);                   // tentative bit, never committed
+			// expectation before the DUT emits it, 1 ms after the bus went free
 			if (i2c_pend >= 0) exp_rec[I2C][i2c_pend][1] = exp_rec[I2C][i2c_pend][1] | 8'h02;
 			else push_probe(I2C, {i2c_sf, 6'b000010}, 8'h00, 8'h00, 8'h00, i2c_le + 1.0e6);
 			i2c_in = 1'b0; i2c_pend = -1; i2c_sf = 2'b00;
 			#(1_300_000);
-			// back to idle without a START: SCL up (SDA low), then SDA up = a STOP
-			// outside any transaction, which the DUT ignores
-			i2c_sda(1'b0); #(IH); i2c_scl(1'b1); #(IH); i2c_sda(1'b1); #(4 * IH);
+		end
+	endtask
+	// One bit whose SCL rise double-crosses (60 ns high, 40 ns low, then high):
+	// the 2-sample filter must see one clean rise.
+	task i2c_glbit(input b);
+		begin
+			i2c_sda(b);    #(IH);
+			i2c_scl(1'b1); #(60); i2c_scl(1'b0); #(40); i2c_scl(1'b1); #(2 * IH - 100);
+			i2c_scl(1'b0); #(IH);
 		end
 	endtask
 	task i2c_write(input [7:0] addr, input integer n, input integer gap);
@@ -1308,12 +1330,20 @@ module can_frame_link_tb;
 			cpha = tb_spi[0]; cpol = tb_spi[1]; lsb = tb_spi[2];
 			urx[3] = cpol;
 			#(half);
-			p38[1] = 1'b0;                                   // CS low
-			#(half);
+			if (spi_lead > 0.0 && !cpha) begin
+				// short CS lead: bit 0's data is already out, CS falls spi_lead ns
+				// before the first sampling edge (contract: may follow CS at once)
+				mo = prnd(0); mi = prnd(0);
+				p2 = mo[lsb ? 0 : 7]; p38[0] = mi[lsb ? 0 : 7];
+				#(half);
+			end else begin
+				p38[1] = 1'b0;                               // CS low
+				#(half);
+			end
 			last_idx = -1; first_idx = n_exp[SPI];
 			for (k = 0; k < nb + ((pbits != 0) ? 1 : 0); k = k + 1) begin
 				nbits = (k < nb) ? 8 : pbits;
-				mo = prnd(0); mi = prnd(0);
+				if (!(k == 0 && spi_lead > 0.0 && !cpha)) begin mo = prnd(0); mi = prnd(0); end
 				amo = 8'h00; ami = 8'h00;
 				for (i = 0; i < nbits; i = i + 1) begin
 					bi = lsb ? i : 7 - i;
@@ -1321,7 +1351,11 @@ module can_frame_link_tb;
 					// Data changes TCO = 100 ns after the shift edge (more than one
 					// 83 ns sample), as a real master/slave output does, so a
 					// decoder that sampled on the shift edge would read the old bit.
-					if (!cpha) begin
+					if (!cpha && k == 0 && i == 0 && spi_lead > 0.0) begin
+						p38[1] = 1'b0; #(spi_lead);          // CS falls just before the first edge
+						urx[3] = ~cpol; ts = $realtime; #(half);
+						urx[3] = cpol;
+					end else if (!cpha) begin
 						if (k != 0 || i != 0) #(SPI_TCO);    // shift edge was the previous trailing edge
 						p2 = mo[bi]; p38[0] = mi[bi]; #(half - ((k != 0 || i != 0) ? SPI_TCO : 0.0));
 						urx[3] = ~cpol; ts = $realtime; #(half);  // leading edge: sample
@@ -1386,7 +1420,7 @@ module can_frame_link_tb;
 	always @(posedge clk_12m)
 		if (dut.mode_q !== tb_mode_q) begin
 			tb_mode_q = dut.mode_q;
-			tb_lvl = 1'b0;
+			tb_lvl = p2;                         // filters start at the current level (no phantom edge)
 			tb_glw = 0;
 			tb_dio = 8'd0;
 			if (tb_mode_q == 2'd1 && dio_pins(0) != 8'd0) dio_expect(dio_pins(0));
@@ -1648,7 +1682,7 @@ module can_frame_link_tb;
 		p2 = 1'b0;
 
 		// -- E: I2C (mode 3), switched while CAN + UART0 stream ------------
-		v3_note("phase E: probe_mode 3 (I2C) set while CAN/UART stream; writes, read with repeated START, NACK, STOP-only, partial byte, timeouts, START sweep, 1 MHz");
+		v3_note("phase E: probe_mode 3 (I2C) set while CAN/UART stream; writes, read with repeated START, NACK, STOP-only, partial byte, timeouts, 5 ms clock stretch, SCL glitches, START sweep, 1 MHz");
 		polling = 1'b1;
 		fork
 			send_mix(10, -1, 40);
@@ -1674,6 +1708,12 @@ module can_frame_link_tb;
 				i2c_timeout;                                 // held byte gets `timeout`
 				i2c_start(300); i2c_timeout;                 // timeout with nothing held
 				i2c_write(8'h42, 3, 300);                    // next START is `start`, not rstart
+				// clock stretching: SCL held low 5 ms after the address ACK is never
+				// a timeout (contract §2); both bytes and the STOP must come through
+				i2c_start(300); i2c_byte(8'hA0, 1'b1); #(5_000_000); i2c_byte(8'h55, 1'b1); i2c_stop;
+				// SCL rise double-crossing (60 ns high / 40 ns low) on bit 4 of 0x55
+				i2c_start(300); i2c_byte(8'hA0, 1'b1); i2c_gl_at = 4; i2c_byte(8'h55, 1'b1); i2c_stop;
+				i2c_start(300); i2c_gl_at = 7; i2c_byte(8'hD2, 1'b1); i2c_gl_at = 0; i2c_byte(8'h0F, 1'b0); i2c_stop;
 				// START sweep: SDA-fall -> SCL-fall gap x phase against the clock
 				for (sw = 0; sw < 4; sw = sw + 1)
 					for (sp = 0; sp < 4; sp = sp + 1) begin
@@ -1706,7 +1746,7 @@ module can_frame_link_tb;
 		         recs_by[I2C] - ph_before[I2C], recs_by[0] - ph_before[0], recs_by[1] - ph_before[1], gaps_total - gaps_before);
 
 		// -- F: SPI (mode 2): modes 0..3, MSB/LSB first, partial, 1.5 MHz ---
-		v3_note("phase F: probe_mode 2 (SPI, set at the end of E in the middle of an I2C byte); modes 0-3, MSB and LSB first, partial bytes, CS-only pulse, SCK 1.5 MHz, 2 MHz and 500 kHz");
+		v3_note("phase F: probe_mode 2 (SPI, set at the end of E in the middle of an I2C byte); modes 0-3, MSB and LSB first, partial bytes, CS-only pulse, SCK 1.5 MHz, 2 MHz and 500 kHz, CS 20-100 ns before the first edge");
 		for (k = 0; k < NSRC; k = k + 1) ph_before[k] = recs_by[k];
 		polling = 1'b1;
 		fork
@@ -1730,15 +1770,22 @@ module can_frame_link_tb;
 				#(5_000);
 				spi_txn(0, 0, 333.0);                         // CS pulse, no clocks: end-only record
 				spi_txn(12, 0, 333.0);                        // 12-byte burst at 1.5 MHz
-				// mid-transaction mode switch: CS low, 1 byte + 3 bits, -> DIO.
-				// The byte goes out (released by bit 1 of the next byte); the 3
-				// bits and the missing CS rise are discarded.
-				#(333); p38[1] = 1'b0; #(333);
-				for (sw = 7; sw >= 0; sw = sw - 1) begin
-					p2 = sw[0]; p38[0] = ~sw[0]; #(333); urx[3] = 1'b1; #(333); urx[3] = 1'b0;
+				for (sw = 0; sw < 3; sw = sw + 1) begin       // CS falls 20 / 60 / 100 ns before the first edge
+					spi_lead = (sw == 0) ? 20.0 : (sw == 1) ? 60.0 : 100.0;
+					spi_txn(4, 0, 333.0);
+					spi_txn(1, 3, 333.0);
 				end
-				push_probe(SPI, 8'h90, 8'hAA, 8'h55, 8'd8, $realtime - 333.0);   // cs_start, data_valid; no cs_end
-				for (sw = 0; sw < 3; sw = sw + 1) begin #(333); urx[3] = 1'b1; #(333); urx[3] = 1'b0; end
+				spi_lead = 0.0;
+				// mid-transaction mode switch: CS low, 2 whole bytes, then -> DIO
+				// (phase G).  Byte 1 goes out (released by byte 2's first bit);
+				// byte 2 is still held at the switch, so the DUT discards it and
+				// counts it as dropped (header `dropped` + flag on the next record).
+				push_probe(SPI, 8'h90, 8'hAA, 8'h55, 8'd8, 0.0);   // byte 1: cs_start, data_valid; no cs_end
+				sp = n_exp[SPI] - 1;                               // (expected before byte 2 releases it)
+				#(333); p38[1] = 1'b0; #(333);
+				for (sw = 15; sw >= 0; sw = sw - 1) begin
+					p2 = sw[0]; p38[0] = ~sw[0]; #(333); urx[3] = 1'b1; if (sw == 8) exp_t0[SPI][sp] = $realtime; #(333); urx[3] = 1'b0;
+				end
 				#(5_000);
 			end
 		join
@@ -1749,7 +1796,7 @@ module can_frame_link_tb;
 		         recs_by[SPI] - ph_before[SPI], recs_by[0] - ph_before[0], recs_by[2] - ph_before[2], gaps_total - gaps_before);
 
 		// -- G: DIO-8 (mode 1): changes, glitches, skewed edges, heartbeats -
-		v3_note("phase G: probe_mode 1 (DIO-8) entered mid-SPI-transaction; changes, sub-us glitches (filtered), skewed multi-channel edges, 100 ms heartbeats");
+		v3_note("phase G: probe_mode 1 (DIO-8) entered mid-SPI-transaction (the held SPI byte is discarded and counted: next record has dropped=1); changes, sub-us glitches (filtered), skewed multi-channel edges, 100 ms heartbeats");
 		for (k = 0; k < NSRC; k = k + 1) ph_before[k] = recs_by[k];
 		sp = n_dio_hb;
 		polling = 1'b1;
@@ -1757,6 +1804,8 @@ module can_frame_link_tb;
 			send_mix(6, -1, 80);
 			uart_script(2, 5, -1, -1, -1);
 			begin
+				n_lost = n_lost + 1;                         // the SPI byte held at this switch
+				lost_expect = lost_expect + 1;
 				set_cfg(2'd1, 3'd0);                         // -> DIO (entry record for probes high)
 				#(20_000);
 				for (sw = 0; sw < 8; sw = sw + 1) dio_set(8'h01 << sw, 6_000);          // walking one
@@ -1785,20 +1834,38 @@ module can_frame_link_tb;
 		stop_poller;
 		drain("G drain");
 		$display("  [t = %0.1f ms]", $realtime / 1e6);
-		$display("  G: DIO %0d records delivered (%0d heartbeats, %0d glitch pulses filtered), %0d dropped",
-		         recs_by[DIO] - ph_before[DIO], n_dio_hb - sp, n_dio_gl, gaps_total - gaps_before);
+		$display("  G: DIO %0d records delivered (%0d heartbeats, %0d glitch pulses filtered), %0d dropped; SPI byte discarded at the switch flagged: %0s",
+		         recs_by[DIO] - ph_before[DIO], n_dio_hb - sp, n_dio_gl, gaps_total - gaps_before, (lost_expect == 0) ? "yes" : "NO");
+		if (lost_expect != 0) begin
+			$display("FAIL [G]: the SPI byte discarded at the mode switch was not flagged as dropped"); errors = errors + 1;
+		end
 
 		// -- H: back to mode 0 with a baud change; rejected C3 blocks -------
-		v3_note("phase H: C3 with bad CRC and with div0=15 (both ignored); probe_mode 0 + baud change (UART0 57600, probe UART 230400), traffic at the new bauds");
+		v3_note("phase H: C3 blocks with bad CRC (low / high byte), div0=15, probe_mode 4, spi_cfg bit 3, 13 bytes (all ignored), 16 bytes and div2=16 (applied); probe_mode 0 entered with PROBE1 low / PROBE2 high; baud change (UART0 57600, probe UART 230400), traffic at the new bauds");
 		for (k = 0; k < NSRC; k = k + 1) ph_before[k] = recs_by[k];
 		polling = 1'b1;
 		rq_gen = tb_gen + 8'd1; rq_mode = 8'd0; rq_spi = 8'd0;
 		for (k = 0; k < 4; k = k + 1) rq_div[k] = tb_div[k];
-		send_cfg(1);                                         // bad CRC: ignored
+		send_cfg(1);                                         // bad CRC (low byte): ignored
 		send_cfg(2);                                         // div0 = 15: ignored
+		send_cfg(3);                                         // probe_mode 4: ignored
+		send_cfg(4);                                         // spi_cfg bit 3: ignored
+		send_cfg(5);                                         // 13 bytes only: ignored
+		send_cfg(7);                                         // bad CRC (high byte): ignored
+		rq_mode = 8'd1;                                      // (stay in DIO)
+		send_cfg(6);                                         // 16 bytes, valid: applies, tail ignored
+		rq_gen = tb_gen + 8'd1; rq_div[2] = 16'd16;
+		send_cfg(0);                                         // div2 = 16 exactly: applies
+		rq_div[2] = div_of(u_baud[2]);                       // restored by the mode-0 block below
+		// Enter mode 0 with PROBE1 low (must not give a UART3 break) and PROBE2
+		// high (no phantom counter edge; the counter record shows level 1).
+		dio_set(8'h02, 20_000);
 		rq_div[0] = div_of(57_600); rq_div[3] = div_of(230_400);
 		set_cfg(2'd0, 3'd0);
 		u_baud[0] = 57_600; u_baud[3] = 230_400;
+		#(100_000);
+		urx[3] = 1'b1;                                       // probe UART line goes idle (mark)
+		#(50_000);
 		p2_en = 1'b1;
 		fork
 			send_mix(8, -1, 40);
@@ -1817,14 +1884,16 @@ module can_frame_link_tb;
 		stop_poller;
 		drain("H drain");
 		$display("  [t = %0.1f ms]", $realtime / 1e6);
-		$display("  H: baud change: UART0 %0d records at 57600, UART3 %0d at 230400; config echo matched in %0d frames; C3 good/bad-CRC/out-of-range = %0d/%0d/%0d",
-		         recs_by[1] - ph_before[1], recs_by[4] - ph_before[4], n_echo_ok, n_cfg[0], n_cfg[1], n_cfg[2]);
+		$display("  H: baud change: UART0 %0d records at 57600, UART3 %0d at 230400; config echo matched in %0d frames; C3 by kind valid/badCRClo/div15/mode4/spi8/short/long/badCRChi = %0d/%0d/%0d/%0d/%0d/%0d/%0d/%0d",
+		         recs_by[1] - ph_before[1], recs_by[4] - ph_before[4], n_echo_ok,
+		         n_cfg[0], n_cfg[1], n_cfg[2], n_cfg[3], n_cfg[4], n_cfg[5], n_cfg[6], n_cfg[7]);
 		if (gaps_total != gaps_before) begin
 			$display("FAIL [E-H]: records dropped while the MCU was keeping up"); errors = errors + 1;
 		end
 		if (recs_by[I2C] == 0 || recs_by[SPI] == 0 || recs_by[DIO] == 0 || recs_by[1] == ph_before[1] || recs_by[4] == ph_before[4] ||
 		    recs_by[CNT] == ph_before[CNT] ||
-		    n_cfg[1] == 0 || n_cfg[2] == 0 || n_dio_hb == 0) begin
+		    n_cfg[1] == 0 || n_cfg[2] == 0 || n_cfg[3] == 0 || n_cfg[4] == 0 || n_cfg[5] == 0 || n_cfg[6] == 0 ||
+		    n_cfg[7] == 0 || n_dio_hb == 0) begin
 			$display("FAIL [E-H]: a v3 scenario produced no records (empty compare)"); errors = errors + 1;
 		end
 
@@ -1839,6 +1908,10 @@ module can_frame_link_tb;
 				$display("FAIL: source %0d delivered no records (empty compare)", k);
 				errors = errors + 1;
 			end
+		end
+		if (fr_dropped !== gaps_total + n_lost) begin
+			$display("FAIL: frame header dropped = %0d, expected %0d missing + %0d discarded on mode changes", fr_dropped, gaps_total, n_lost);
+			errors = errors + 1;
 		end
 		if (recs_ok + gaps_total + infl != gseq) begin
 			$display("FAIL: %0d delivered + %0d dropped + %0d in flight != %0d records", recs_ok, gaps_total, infl, gseq);
