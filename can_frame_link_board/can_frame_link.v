@@ -334,7 +334,7 @@ module top #(
 			assign f_rej[gf] = (pr_s[gf] == f_lvl[gf]) && (stab != 4'd0);   // excursion ended early
 			always @(posedge clk)
 				if (f_rst) begin
-					f_lvl[gf] <= 1'b0;
+					f_lvl[gf] <= pr_s[gf];   // start at the current level: no phantom edge on mode entry
 					stab      <= 4'd0;
 				end else if (pr_s[gf] == f_lvl[gf])
 					stab <= 4'd0;
@@ -360,8 +360,10 @@ module top #(
 	wire        cnt_load;                    // the counter slot loads (defined with the slots)
 
 	// synthesis translate_off
-	initial if (GLITCH_CLKS < 2 || GLITCH_CLKS > 15 || HB_PERIOD_US < 2 || HB_PERIOD_US > 131071) begin
-		$display("top: GLITCH_CLKS=%0d / HB_PERIOD_US=%0d out of range", GLITCH_CLKS, HB_PERIOD_US);
+	initial if (GLITCH_CLKS < 2 || GLITCH_CLKS > 15 || HB_PERIOD_US < 2 || HB_PERIOD_US > 131071 ||
+	            I2C_TIMEOUT_US < 2 || I2C_TIMEOUT_US > 1023) begin
+		$display("top: GLITCH_CLKS=%0d / HB_PERIOD_US=%0d / I2C_TIMEOUT_US=%0d out of range",
+		         GLITCH_CLKS, HB_PERIOD_US, I2C_TIMEOUT_US);
 		$finish;
 	end
 	// synthesis translate_on
@@ -430,22 +432,40 @@ module top #(
 	// ----------------------------------------------------------------
 	// I2C (mode 3) and SPI (mode 2) decoders
 	// ----------------------------------------------------------------
-	wire        i2c_stb, i2c_tsld;
+	wire        i2c_stb, i2c_tsld, i2c_held;
 	wire [7:0]  i2c_flags, i2c_data;
 	probe_i2c #(.TIMEOUT_US(I2C_TIMEOUT_US)) u_i2c (
 		.clk(clk), .rst(rst | ~m_i2c), .us_tick(us_tick),
-		.scl(pr_s[0]), .scl_d(pr_d[0]), .sda(pr_s[1]), .sda_d(pr_d[1]),
-		.ev_stb(i2c_stb), .ev_flags(i2c_flags), .ev_data(i2c_data), .ts_ld(i2c_tsld));
+		.scl_s(pr_s[0]), .scl_sd(pr_d[0]), .sda_s(pr_s[1]), .sda_sd(pr_d[1]),
+		.ev_stb(i2c_stb), .ev_flags(i2c_flags), .ev_data(i2c_data), .ts_ld(i2c_tsld), .held(i2c_held));
 
-	wire        spi_stb, spi_tsld;
+	wire        spi_stb, spi_tsld, spi_held;
 	wire [7:0]  spi_flags, spi_mo, spi_mi;
 	wire [3:0]  spi_nb;
 	probe_spi u_spi (
 		.clk(clk), .rst(rst | ~m_spi | spi_chg), .cfg(spi_q),
-		.sck(pr_s[0]), .sck_d(pr_d[0]), .mosi(pr_s[1]), .miso(pr_s[2]),
-		.cs(pr_s[3]), .cs_d(pr_d[3]),
+		.sck_s(pr_s[0]), .sck_sd(pr_d[0]), .mosi_s(pr_s[1]), .miso_s(pr_s[2]),
+		.cs_s(pr_s[3]), .cs_sd(pr_d[3]),
 		.ev_stb(spi_stb), .ev_flags(spi_flags), .ev_mosi(spi_mo), .ev_miso(spi_mi),
-		.ev_nbits(spi_nb), .ts_ld(spi_tsld));
+		.ev_nbits(spi_nb), .ts_ld(spi_tsld), .held(spi_held));
+
+	// A completed record discarded by a mode / spi_cfg change is counted as a
+	// dropped record (frame header `dropped`, and `dropped` on the next record):
+	//  - I2C / SPI: in the first clock of the new mode the old decoder is being
+	//    reset; a byte it still holds, or an event it emitted in the clock of
+	//    the change (which the slot mux, now following the new mode, ignores),
+	//    is lost.
+	//  - SPI: a held byte when spi_cfg changes (the decoder resets then).
+	//  - DIO: a change record whose coalescing window is open at the change.
+	// At most one of these per clock.  Half-received bytes are not records and
+	// are not counted (contract §1: no half-decoded byte carries over).
+	reg  [1:0] mode_qp = 2'd0;              // mode_q one clock ago
+	always @(posedge clk) mode_qp <= mode_q;
+	wire       lost_rec = !rst && (
+	              ((mode_q != mode_qp) && (((mode_qp == 2'd3) && (i2c_held || i2c_stb)) ||
+	                                       ((mode_qp == 2'd2) && (spi_held || spi_stb)))) ||
+	              (spi_chg && m_spi && spi_held) ||
+	              (mode_chg && m_dio && dio_co));
 
 	// Shared probe timestamp (DIO, SPI, I2C; one runs at a time).  DIO change
 	// records take us_ctr - 1 (the 1 us filter delay), everything else us_ctr.
@@ -593,7 +613,8 @@ module top #(
 	wire [NS-1:0] load    = arrive & (~valid | grant);   // slot free (or freeing now)
 	wire [NS-1:0] overrun = arrive & valid & ~grant;     // slot still full: drop the new one
 	wire [2:0]    drop_add = {2'b00, overrun[0]} + {2'b00, overrun[1]} + {2'b00, overrun[2]} +
-	                         {2'b00, overrun[3]} + {2'b00, overrun[4]} + {2'b00, overrun[5]};
+	                         {2'b00, overrun[3]} + {2'b00, overrun[4]} + {2'b00, overrun[5]} +
+	                         {2'b00, lost_rec};         // <= 7
 	assign cnt_load = load[5];
 
 	always @(posedge clk) begin : slots
@@ -648,7 +669,7 @@ module top #(
 			out_vec[UART_DROP_BIT] <= drop_stky;
 		end
 		// Set wins: a drop in the same clock as an accept belongs after it.
-		if (rec_dropped || overrun != {NS{1'b0}})
+		if (rec_dropped || overrun != {NS{1'b0}} || lost_rec)
 			drop_stky <= 1'b1;
 		else if (rec_accept)
 			drop_stky <= 1'b0;

@@ -21,7 +21,17 @@
  *
  * rst holds a decoder idle (can_frame_link.v asserts it whenever the probe
  * mode is not this decoder's, and on a mode / SPI-config change), so no half
- * decoded byte survives a mode change.
+ * decoded byte survives a mode change.  `held` tells the top a completed byte
+ * is waiting in ev_*; if the decoder is reset with it there, the top counts it
+ * as a dropped record.
+ *
+ * Deglitch (contract §2, ruled 2026-11-01): every line a decoder uses passes a
+ * 2-sample stability filter: the filtered level takes a new value only when
+ * two consecutive synchronised samples (~167 ns) agree on it.  A crossing that
+ * lasts a single 83 ns sample (ringing on a slow edge, a double crossing) is
+ * ignored.  All lines of one decoder get the same filter, so their relative
+ * timing is unchanged (each clean edge is delayed by exactly one clock).  SCK
+ * / SCL high and low times must be >= ~170 ns: SPI is specified to 1.5 MHz.
  */
 `default_nettype none
 
@@ -55,10 +65,11 @@
 //        b2 ack (SDA low on the 9th clock), b1 timeout, b0 partial.
 // partial: the transaction ended (STOP, timeout or repeated START) after
 //   1..8 committed bits but before the ACK clock; data = the bits received,
-//   MSB-aligned (first bit in bit 7, unreceived bits 0), data_valid = 1,
-//   ack = 0.  (A byte cut by a repeated START is reported the same way.)
-// timeout: inside a transaction, no SCL or SDA edge for TIMEOUT_US (1 ms);
-//   the transaction is then closed (the next START reports `start`).
+//   MSB-aligned (first bit in bit 7, unreceived bits 0), data_valid = 0,
+//   ack = 0 (contract §2 ruling 2026-11-01).
+// timeout: inside a transaction, the bus idle - SCL AND SDA both high - for
+//   TIMEOUT_US (1 ms); the transaction is then closed (the next START reports
+//   `start`).  SCL held low (clock stretching, any length) never times out.
 // start / rstart: set on the first record after START / repeated START
 //   (whatever its kind, so a START immediately followed by STOP is one
 //   record: start=1, stop=1, data_valid=0).
@@ -70,20 +81,41 @@ module probe_i2c #(
 	input  wire        clk,
 	input  wire        rst,
 	input  wire        us_tick,        // 1 clock per microsecond
-	input  wire        scl, scl_d,     // synchronised sample now / previous
-	input  wire        sda, sda_d,
+	input  wire        scl_s, scl_sd,  // synchronised sample now / previous
+	input  wire        sda_s, sda_sd,
 	output reg         ev_stb,         // 1 clock: the record in ev_flags/ev_data is complete
 	output reg  [7:0]  ev_flags,
 	output reg  [7:0]  ev_data,
-	output wire        ts_ld           // capture us_ctr into the shared probe timestamp now
+	output wire        ts_ld,          // capture us_ctr into the shared probe timestamp now
+	output wire        held            // a completed byte waits in ev_*
 );
 	localparam [7:0] F_STOP = 8'h20, F_DV = 8'h10, F_TMO = 8'h02, F_PART = 8'h01;
+
+	// synthesis translate_off
+	initial if (TIMEOUT_US < 2 || TIMEOUT_US > 1023) begin
+		$display("probe_i2c: TIMEOUT_US=%0d out of range 2..1023 (10-bit counter)", TIMEOUT_US);
+		$finish;
+	end
+	// synthesis translate_on
+
+	// 2-sample deglitch, same on both lines: scl/sda = filtered now, *_d = before.
+	reg scl = 1'b1, scl_d = 1'b1, sda = 1'b1, sda_d = 1'b1;
+	always @(posedge clk) begin
+		if (rst) begin
+			scl <= scl_s; scl_d <= scl_s; sda <= sda_s; sda_d <= sda_s;
+		end else begin
+			if (scl_s == scl_sd) scl <= scl_s;
+			if (sda_s == sda_sd) sda <= sda_s;
+			scl_d <= scl;
+			sda_d <= sda;
+		end
+	end
 
 	wire scl_rise =  scl & ~scl_d;
 	wire scl_fall = ~scl &  scl_d;
 	wire start_c  = ~sda &  sda_d & scl;
 	wire stop_c   =  sda & ~sda_d & scl;
-	wire any_edge = (scl ^ scl_d) | (sda ^ sda_d);
+	wire bus_free =  scl & sda;        // released: the only state that can time out
 
 	reg        in_txn = 1'b0;      // between START and STOP / timeout
 	reg  [1:0] s_flag = 2'b00;     // {start, rstart} for the next record
@@ -92,7 +124,8 @@ module probe_i2c #(
 	reg  [3:0] cnt    = 4'd0;      // committed bits of the current byte (0..8)
 	reg  [7:0] sh     = 8'd0;      // bit k written at 7-k (MSB first)
 	reg        pend_v = 1'b0;      // ev_* hold a completed byte awaiting its follow-up
-	reg  [9:0] idle_us = 10'd0;
+	reg  [9:0] idle_us = 10'd0;       // microseconds with SCL and SDA both high
+	assign held = pend_v;
 
 	// Decisions for this clock (priority: START, STOP, timeout, bits).
 	wire tmo      = in_txn && us_tick && (idle_us == TIMEOUT_US - 1);
@@ -113,7 +146,7 @@ module probe_i2c #(
 			in_txn <= 1'b0; s_flag <= 2'b00; tbit_v <= 1'b0; cnt <= 4'd0; sh <= 8'd0;
 			pend_v <= 1'b0; idle_us <= 10'd0;
 		end else begin
-			if (any_edge)     idle_us <= 10'd0;
+			if (!bus_free)    idle_us <= 10'd0;
 			else if (us_tick) idle_us <= (idle_us == 10'd1023) ? idle_us : idle_us + 10'd1;
 
 			if (start_c || stop_c || tmo) begin
@@ -123,7 +156,7 @@ module probe_i2c #(
 						ev_flags <= ev_flags | why;
 					end else if (close_new) begin
 						ev_stb   <= 1'b1;                       // cut-short byte or a bare marker
-						ev_flags <= {s_flag, 6'd0} | why | ((cnt != 4'd0) ? (F_DV | F_PART) : 8'h00);
+						ev_flags <= {s_flag, 6'd0} | why | ((cnt != 4'd0) ? F_PART : 8'h00);   // partial: data_valid 0
 						ev_data  <= sh;
 					end
 				end
@@ -163,17 +196,19 @@ endmodule
 // MISO = PROBE3, CS = PROBE4 (active low).  cfg = {lsb_first, cpol, cpha}.
 //
 // Sampling edge: rising when CPOL == CPHA (modes 0 and 3), falling otherwise
-// (modes 1 and 2).  MOSI and MISO are taken from the same synchronised sample
-// in which the SCK edge is first seen, i.e. within one clock (83 ns) after the
-// real edge; they are stable there for half an SCK period, so any SCK whose
-// half period exceeds ~2 clocks (167 ns) decodes: 1.5 MHz (4 clocks per half
-// period) is supported with margin, ~3 MHz is the theoretical ceiling.
+// (modes 1 and 2).  SCK, CS, MOSI and MISO all pass the same 2-sample filter.
+// MOSI and MISO are taken from the same filtered sample in which the SCK edge
+// is first seen; they are stable there for half an SCK period minus the
+// device's output delay.  SCK high and low must each last >= ~170 ns (two
+// samples): supported to 1.5 MHz (contract), 2 MHz tested.
 //
 // Framing: after reset the decoder waits until CS has been seen high
 // (`armed`), so a mode change in the middle of a transaction does not decode
-// its tail.  CS falling starts a segment; edges are counted only while CS was
-// low in the previous sample (an edge in the same sample as CS rising still
-// counts: some masters raise CS right after the last edge).  Bit k of a byte
+// its tail.  CS falling starts a segment; a sampling edge seen in the same
+// clock as CS falling is bit 0 (the first SCK edge may follow CS immediately).
+// After that, edges are counted while CS was low in the previous sample (an
+// edge in the same sample as CS rising still counts: some masters raise CS
+// right after the last edge).  Bit k of a byte
 // is written at index 7-k (MSB first) or k (LSB first), so a cut-short byte is
 // already MSB-aligned / LSB-aligned as the contract asks.
 //
@@ -194,18 +229,37 @@ module probe_spi (
 	input  wire        clk,
 	input  wire        rst,
 	input  wire [2:0]  cfg,            // {lsb_first, cpol, cpha}
-	input  wire        sck, sck_d,     // synchronised sample now / previous
-	input  wire        mosi,
-	input  wire        miso,
-	input  wire        cs,  cs_d,
+	input  wire        sck_s, sck_sd,  // synchronised sample now / previous
+	input  wire        mosi_s,
+	input  wire        miso_s,
+	input  wire        cs_s, cs_sd,
 	output reg         ev_stb,         // 1 clock: the record in ev_* is complete
 	output reg  [7:0]  ev_flags,
 	output reg  [7:0]  ev_mosi,
 	output reg  [7:0]  ev_miso,
 	output reg  [3:0]  ev_nbits,
-	output wire        ts_ld           // capture us_ctr into the shared probe timestamp now
+	output wire        ts_ld,          // capture us_ctr into the shared probe timestamp now
+	output wire        held            // a completed byte waits in ev_*
 );
 	wire cpha = cfg[0], cpol = cfg[1], lsb = cfg[2];
+
+	// 2-sample deglitch, same on all four lines (sck/cs: filtered now, *_d before).
+	reg sck = 1'b0, sck_d = 1'b0, cs = 1'b1, cs_d = 1'b1, mosi = 1'b0, miso = 1'b0;
+	reg mosi_p = 1'b0, miso_p = 1'b0;          // previous samples of MOSI / MISO
+	always @(posedge clk) begin
+		mosi_p <= mosi_s;
+		miso_p <= miso_s;
+		if (rst) begin
+			sck <= sck_s; sck_d <= sck_s; cs <= cs_s; cs_d <= cs_s; mosi <= mosi_s; miso <= miso_s;
+		end else begin
+			if (sck_s  == sck_sd) sck  <= sck_s;
+			if (cs_s   == cs_sd)  cs   <= cs_s;
+			if (mosi_s == mosi_p) mosi <= mosi_s;
+			if (miso_s == miso_p) miso <= miso_s;
+			sck_d <= sck;
+			cs_d  <= cs;
+		end
+	end
 
 	reg        armed  = 1'b0;      // CS seen high since reset
 	reg        in_cs  = 1'b0;
@@ -213,10 +267,11 @@ module probe_spi (
 	reg  [2:0] cnt    = 3'd0;      // bits of the current byte
 	reg  [7:0] mo     = 8'd0, mi = 8'd0;
 	reg        pend_v = 1'b0;      // ev_* hold a completed byte awaiting its follow-up
+	assign held = pend_v;
 
 	wire edge_s  = (cpol ^ cpha) ? (~sck & sck_d) : (sck & ~sck_d);
-	wire samp    = in_cs && !cs_d && edge_s;
 	wire cs_fall = armed && !in_cs && !cs && cs_d;
+	wire samp    = edge_s && ((in_cs && !cs_d) || cs_fall);   // incl. an edge in the CS-fall clock
 	wire cs_rise = in_cs && cs && !cs_d;
 	wire [2:0] idx = lsb ? cnt : (3'd7 - cnt);
 
@@ -243,7 +298,12 @@ module probe_spi (
 		end else begin
 			if (cs) armed <= 1'b1;
 			if (cs_fall) begin
-				in_cs <= 1'b1; first <= 1'b1; cnt <= 3'd0; mo <= 8'd0; mi <= 8'd0; pend_v <= 1'b0;
+				// cnt = 0 and mo = mi = 0 here (cleared at the last CS rise / reset),
+				// so mo_w / mi_w hold just bit 0 when an edge came with CS.
+				in_cs <= 1'b1; first <= 1'b1; pend_v <= 1'b0;
+				cnt <= samp ? 3'd1 : 3'd0;
+				mo  <= samp ? mo_w : 8'd0;
+				mi  <= samp ? mi_w : 8'd0;
 			end else if (in_cs) begin
 				if (byte_done) begin
 					ev_flags <= {first, cs_rise, 1'b0, 1'b1, 4'd0};

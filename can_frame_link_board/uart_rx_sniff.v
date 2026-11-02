@@ -80,8 +80,15 @@ module uart_rx_sniff #(
 	wire       vote  = (smp_n[0] & smp_n[1]) | (smp_n[0] & smp_n[2]) | (smp_n[1] & smp_n[2]);
 	wire [3:0] bitn  = cnt[7:4];
 
+	// After reset (POR, or the probe UART entering mode 0) a start bit is only
+	// accepted once the line has been seen high (idle mark): a line that is
+	// low at that moment is not a start bit, and would otherwise be reported
+	// as a framing error or break.
+	reg armed = 1'b0;
+	always @(posedge clk) armed <= !rst && (armed || rx_s);
+
 	assign busy = (st == S_RX);
-	assign start_edge = !rst && (st == S_IDLE) && !rx_s;
+	assign start_edge = !rst && armed && (st == S_IDLE) && !rx_s;
 
 	always @(posedge clk) begin
 		strobe <= 1'b0;
