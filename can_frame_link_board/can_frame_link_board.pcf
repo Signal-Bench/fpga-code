@@ -1,19 +1,28 @@
 # can_frame_link on the SignalBench PCBA (U7 iCE40UP5K-SG48), NOT the UPduino.
-# Pins per validation/battery_can_chain/CONTRACT.md sections 1, 4, 5, 7.1 (live netlist,
-# altium_audit/LIVE/netlist.csv) and FPGA_PINOUT_ICE40UP5K-SG48.md.
+# Pins per validation/battery_can_chain/CONTRACT.md sections 1, 4, 5, 7.1 and
+# docs/PROTOCOL_V3_CONTRACT.md section 1 (live netlist, altium_audit/LIVE/netlist.csv)
+# and FPGA_PINOUT_ICE40UP5K-SG48.md.
 # Every top-level port is listed. spi_miso is the ONLY output (tri-stated while CS
 # is high). Everything else on the package is left unused (input, no drive):
 # in particular pin 16 (FT_SSn, flash/FT232H CS), pin 18 (RT_MOSI, dead pad F1),
-# pins 10/19 (flash WP#/HOLD#), probe inputs PROBE3-8 and RGB0-2.
-# PROBE1/PROBE2 (CONTRACT 7.1) are inputs with the pad pull-up OFF: U19
+# pins 10/19 (flash WP#/HOLD#) and RGB0-2.
+# PROBE1..8 (CONTRACT 7.1, PROTOCOL_V3 1) are inputs with the pad pull-up OFF: U19
 # SN74LVC8T245 (A->B, DIR=+3V3, /OE=GND, hard-wired) drives them push-pull.
+# Their use depends on probe_mode: 0 UART3 (P1) + edge counter (P2), 1 DIO-8,
+# 2 SPI (P1 SCK, P2 MOSI, P3 MISO, P4 CS), 3 I2C (P1 SCL, P2 SDA).
 set_io clk_12m     44   # IOB_3b_G6  <- Y1 12 MHz via U4 2Y (global G6)       in
 set_io can_rx_pin  27   # IOT_38b    <- U15 TCAN330 RXD (FPGA_CAN_RX)         in, pull-up
 set_io uart0_pin   23   # IOT_37a    <- U13 ROUT1 (FPGA_RS232_RX_OUT, P1.7)   in, pull-up
 set_io uart1_pin   25   # IOT_36b    <- U13 ROUT2 (FPGA_RS232_TX_OUT, P1.8)   in, pull-up
 set_io uart2_pin   26   # IOT_39a    <- U14 RO    (FPGA_RS485_RX, P1.3/4)     in, pull-up
-set_io probe1_pin  32   # IOT_43a    <- U19 B (IDC1_BUF <- P1.9 PROBE1)       in, no pull (UART3)
-set_io probe2_pin  35   # IOT_46b_G0 <- U19 B (IDC2_BUF <- P1.10 PROBE2)      in, no pull (edge counter)
+set_io probe1_pin  32   # IOT_43a    <- U19 B (IDC1_BUF <- P1.9  PROBE1)      in, no pull
+set_io probe2_pin  35   # IOT_46b_G0 <- U19 B (IDC2_BUF <- P1.10 PROBE2)      in, no pull
+set_io probe3_pin  31   # IOT_42b    <- U19 B (IDC3_BUF <- P1.11 PROBE3)      in, no pull
+set_io probe4_pin  37   # IOT_45a_G1 <- U19 B (IDC4_BUF <- P1.12 PROBE4)      in, no pull
+set_io probe5_pin  34   # IOT_44b    <- U19 B (IDC5_BUF <- P1.13 PROBE5)      in, no pull
+set_io probe6_pin  43   # IOT_49a    <- U19 B (IDC6_BUF <- P1.14 PROBE6)      in, no pull
+set_io probe7_pin  36   # IOT_48b    <- U19 B (IDC7_BUF <- P1.15 PROBE7)      in, no pull
+set_io probe8_pin  42   # IOT_51a    <- U19 B (IDC8_BUF <- P1.16 PROBE8)      in, no pull
 set_io spi_sck     20   # RT_SCK     <- ESP32 GPIO10 (also LCD SCK, global G3) in
 set_io spi_cs      47   # RT_CSn     <- ESP32 GPIO27, active low               in
 set_io spi_mosi    48   # FPGA_IRQn  <- ESP32 GPIO22 (MOSI rework, finding F1)  in

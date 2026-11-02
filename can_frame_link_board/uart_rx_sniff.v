@@ -2,13 +2,22 @@
  * uart_rx_sniff.v — passive 8-N-1 UART receiver for the SignalBench sniffer.
  *
  * New for can_frame_link_board (2026-10-11), CONTRACT.md §4/§5.
+ * Protocol v3 (2026-11-01, PROTOCOL_V3_CONTRACT.md §3): the bit period is a
+ * RUNTIME input `div` = round(CLK_HZ / baud) clocks, set by the ESP's C3
+ * config block (16..65535 = 750 000 .. 184 baud).  It was a BAUD parameter.
  *
- *  - Oversampling: an NCO makes a tick at exactly 16 x BAUD on average from
- *    the 12 MHz board clock (acc += 16*BAUD, wrap at CLK_HZ), so the average
- *    rate is exact for any BAUD; only the phase is quantised to one clock.
- *    At the 9600 default (CONTRACT §6): 1250 clocks/bit, a tick every 78.125
- *    clocks (78 or 79), jitter 83 ns = 0.08% of a bit.  At 115200: a tick
- *    every 6.51 clocks, jitter 1% of a bit.  Break at 9600 = >= 1.04 ms low.
+ *  - Oversampling: an NCO makes a tick at exactly 16 / div per clock on
+ *    average (acc += 16, wrap at div), i.e. 16 ticks per div-clock bit, so the
+ *    average rate is exact for the configured divisor; only the phase is
+ *    quantised to one clock.  The only rate error is the rounding of div
+ *    (<= 0.5 clock per bit: exact at 9600 / div 1250, +0.16% at 115200 /
+ *    div 104).  At div 1250: a tick every 78.125 clocks (78 or 79), jitter
+ *    83 ns = 0.08% of a bit.  At div 104: a tick every 6.5 clocks, jitter 1%
+ *    of a bit.  Break at 9600 = >= 1.04 ms low.
+ *  - A divisor change takes effect at the next tick; a byte in flight when it
+ *    changes may be received wrongly (the ESP changes baud between bytes).
+ *    div < 16 is never applied (the config block is rejected); if it ever
+ *    were, ticks would come every clock (16x at 750 kbaud is the ceiling).
  *  - Start: the falling edge is detected at the CLOCK rate while armed (not
  *    on a tick: at 9600 a tick is 6.5 us, which would quantise the timestamp).
  *    The timestamp (us since reset) is latched on that clock, 2-3 clocks
@@ -32,11 +41,11 @@
 `default_nettype none
 
 module uart_rx_sniff #(
-	parameter integer CLK_HZ = 12_000_000,
-	parameter integer BAUD   = 9_600
+	parameter integer CLK_HZ = 12_000_000     // documentation only: div is in clocks
 ) (
 	input  wire        clk,
 	input  wire        rst,
+	input  wire [15:0] div,         // clocks per bit, 16..65535 (runtime, from the C3 config)
 	input  wire        rx,          // idle high
 	input  wire [31:0] us_now,      // free-running microsecond counter
 	output reg         strobe,      // 1-clk: data/fe/brk/ts valid
@@ -46,15 +55,6 @@ module uart_rx_sniff #(
 	output reg  [31:0] ts,
 	output wire        busy         // receiving (for testbench mirrors)
 );
-	localparam integer INC = 16 * BAUD;
-
-	// synthesis translate_off
-	initial if (INC > CLK_HZ || BAUD < 300) begin
-		$display("uart_rx_sniff: BAUD=%0d not supported at CLK_HZ=%0d (need 16*BAUD <= CLK_HZ)", BAUD, CLK_HZ);
-		$finish;
-	end
-	// synthesis translate_on
-
 	initial begin strobe = 1'b0; data = 8'd0; fe = 1'b0; brk = 1'b0; ts = 32'd0; end
 
 	// -- synchroniser ----------------------------------------------------
@@ -62,12 +62,12 @@ module uart_rx_sniff #(
 	always @(posedge clk) rx_q <= {rx_q[0], rx};
 	wire rx_s = rx_q[1];
 
-	// -- 16x NCO -----------------------------------------------------------
-	reg  [24:0] acc  = 25'd0;
-	wire [24:0] nxt  = acc + INC[24:0];
-	wire        tick = (nxt >= CLK_HZ[24:0]);
+	// -- 16x NCO: 16 ticks per div clocks ------------------------------------
+	reg  [16:0] acc  = 17'd0;
+	wire [16:0] nxt  = acc + 17'd16;
+	wire        tick = (nxt >= {1'b0, div});
 	wire        start_edge;          // defined below: realigns the NCO
-	always @(posedge clk) acc <= start_edge ? 25'd0 : tick ? (nxt - CLK_HZ[24:0]) : nxt;
+	always @(posedge clk) acc <= start_edge ? 17'd0 : tick ? (nxt - {1'b0, div}) : nxt;
 
 	// -- receiver ------------------------------------------------------------
 	localparam [1:0] S_IDLE = 2'd0, S_RX = 2'd1, S_WAITHI = 2'd2;

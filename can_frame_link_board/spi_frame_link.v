@@ -96,6 +96,39 @@
  *     possible without storing record boundaries, since lengths differ.)
  *
  *  5. Status outputs (ctrl_good, frame_sent) replace the LEDs.
+ *
+ * CHANGES (SignalBench protocol v3, 2026-11-01, docs/PROTOCOL_V3_CONTRACT.md §3).
+ *
+ *  6. C3 config block.  A CS transaction whose first MOSI byte is 0xC3 is a
+ *     config write, not a stream read:
+ *       C3 | gen | probe_mode | spi_cfg | div0 u16 LE | div1 | div2 | div3 | crc16 BE
+ *     14 bytes, CRC-16/CCITT-FALSE (this file's crc16_byte) over bytes 0..11,
+ *     sent big-endian in bytes 12..13 (same CRC and byte order as the 5C
+ *     block).  Bytes 1..9 are captured in the 5C block's byte registers
+ *     (c_ack/c_len/c_flags/c_crc, which store bytes 1..9 whatever byte 0
+ *     is), bytes 10..11 in two of their own and byte 12 is compared on
+ *     arrival with the CRC high byte; when byte 13 arrives the fields are
+ *     copied into the sticky config registers
+ *     (outputs cfg_*) only if the CRC matches AND probe_mode <= 3, spi_cfg
+ *     bits 7..3 are 0 and every divN >= 16.  Otherwise nothing changes.
+ *     Bytes after 13 are ignored; a transaction that ends before byte 13
+ *     changes nothing.
+ *     A C3 transaction never reaches the frame decision (DEC_*): no ack is
+ *     applied, nothing is fetched, sent_hw / rd_off / `dropped_reported` /
+ *     ctrl_good / the ST_DROPPED edge are untouched, so it cannot consume,
+ *     ack or advance stream data.  Its MISO is A5 5A 01, the echo bytes, then
+ *     poisoned filler: don't-care, the ESP discards it.
+ *     Reset (configuration) values: gen 0, probe_mode 0, spi_cfg 0, div
+ *     1250 / 1250 / 1250 / 104 (9600 / 9600 / 9600 / 115200 baud), the
+ *     DIVn_RST parameters.
+ *
+ *  7. Echo.  MISO bytes 3 and 4 of every frame, formerly fixed 0x00, carry
+ *     the applied config: byte 3 = gen, byte 4 = probe_mode.  Bytes 5..10
+ *     stay 0x00.  Bytes 1..10 are, and always were, covered by the frame CRC
+ *     (the CRC runs over bytes 0 .. 22+2*count-1), so the CRC is computed over
+ *     the echo bytes actually sent; the prep pipeline needs no change because
+ *     the config registers only change inside a C3 transaction, never during
+ *     a 5C read, so bytes 3..4 are constant for the whole transfer.
  */
 `default_nettype none
 
@@ -104,7 +137,12 @@ module spi_frame_link #(
 	parameter integer MAX_FRAME_SAMPLES = 2036,   // (4096 - 24) / 2
 	parameter integer MAX_REC_SAMPLES   = 10,     // longest record offered (<= 15)
 	// Test hook: where the stream offsets start.  Leave at 0 in hardware.
-	parameter [31:0]  INITIAL_OFFSET    = 32'd0
+	parameter [31:0]  INITIAL_OFFSET    = 32'd0,
+	// C3 config reset values (contract §3): UART clocks per bit
+	parameter [15:0]  DIV0_RST          = 16'd1250,   // RS-232 RX   9600
+	parameter [15:0]  DIV1_RST          = 16'd1250,   // RS-232 TX   9600
+	parameter [15:0]  DIV2_RST          = 16'd1250,   // RS-485      9600
+	parameter [15:0]  DIV3_RST          = 16'd104     // probe UART  115200
 ) (
 	input  wire        clk,
 	// SPI slave pins (already through the pad; synchronised here)
@@ -123,13 +161,23 @@ module spi_frame_link #(
 	input  wire [2:0]  drop_add,     // records the producer lost upstream this cycle (counted too)
 	// Status
 	output reg         ctrl_good,    // last control block was valid
-	output reg         frame_sent    // 1-clk: a frame carrying samples was decided
+	output reg         frame_sent,   // 1-clk: a frame carrying samples was decided
+	// Applied C3 config (sticky; change only on a valid C3 block)
+	output reg  [7:0]  cfg_gen,
+	output reg  [1:0]  cfg_mode,     // probe_mode 0..3
+	output reg  [2:0]  cfg_spi,      // {lsb_first, cpol, cpha}
+	output reg  [15:0] cfg_div0,
+	output reg  [15:0] cfg_div1,
+	output reg  [15:0] cfg_div2,
+	output reg  [15:0] cfg_div3,
+	output reg         cfg_stb       // 1-clk: a config block was applied
 );
 	localparam [31:0] CAPACITY = 32'd1 << BUF_AW;
 
 	// Protocol constants — keep in sync with README.md and the MCU parser.
 	localparam [7:0]  VERSION    = 8'h01;
 	localparam [7:0]  CTRL_MAGIC = 8'h5C;
+	localparam [7:0]  CFG_MAGIC  = 8'hC3;
 	localparam [15:0] HDR_LEN    = 16'd22;   // bytes before the first sample
 	localparam [15:0] OVERHEAD   = 16'd24;   // header + CRC
 
@@ -290,6 +338,30 @@ module spi_frame_link #(
 	reg [15:0] c_crc     = 0;
 	wire [7:0] rx_byte   = {rx_shift[6:0], mosi_bit};
 
+	// C3 config block (change 6).  Bytes 1..9 land in the 5C block's own
+	// registers (the byte-position case below stores them whatever byte 0
+	// was): c_ack = bytes 1..4, c_len = 5..6, c_flags = 7, c_crc = 8..9.
+	// Only bytes 10..12 need registers of their own.
+	reg        cfg_txn    = 1'b0;     // this transaction started with 0xC3
+	reg [15:0] cfg_b1011  = 0;        // bytes 10, 11 (div3, little-endian)
+	reg        cfg_crc_hi = 1'b0;     // byte 12 matched the CRC high byte
+	wire [7:0]  sh_gen  = c_ack[7:0];
+	wire [7:0]  sh_mode = c_ack[15:8];
+	wire [7:0]  sh_spi  = c_ack[23:16];
+	wire [15:0] sh_div0 = {c_len[7:0], c_ack[31:24]};       // little-endian fields
+	wire [15:0] sh_div1 = {c_flags, c_len[15:8]};
+	wire [15:0] sh_div2 = {c_crc[7:0], c_crc[15:8]};
+	wire [15:0] sh_div3 = cfg_b1011;
+	// Evaluated in the clock byte 13 is processed (rx_byte_q = CRC low byte).
+	wire cfg_valid = cfg_crc_hi && (rx_byte_q == crc_rx[7:0]) &&
+	                 (sh_mode[7:2] == 6'd0) && (sh_spi[7:3] == 5'd0) &&
+	                 (sh_div0[15:4] != 12'd0) && (sh_div1[15:4] != 12'd0) &&
+	                 (sh_div2[15:4] != 12'd0) && (sh_div3[15:4] != 12'd0);
+	initial begin
+		cfg_gen = 8'd0; cfg_mode = 2'd0; cfg_spi = 3'd0; cfg_stb = 1'b0;
+		cfg_div0 = DIV0_RST; cfg_div1 = DIV1_RST; cfg_div2 = DIV2_RST; cfg_div3 = DIV3_RST;
+	end
+
 	// Frame decision pipeline.
 	localparam [3:0] DEC_IDLE  = 4'd0,
 	                 DEC_CHECK = 4'd1,   // CRC compare; ack - rd and hw - rd
@@ -369,6 +441,8 @@ module spi_frame_link #(
 			case (p1_sel)
 				5'd1:    p2_byte <= 8'h5A;
 				5'd2:    p2_byte <= VERSION;
+				5'd3:    p2_byte <= cfg_gen;                // echo (change 7)
+				5'd4:    p2_byte <= {6'd0, cfg_mode};
 				default: p2_byte <= 8'h00;
 			endcase
 		end else if (!hdr_ready) begin
@@ -430,11 +504,34 @@ module spi_frame_link #(
 
 		// -- control block bytes, one cycle after they arrive --
 		rx_done <= 1'b0;
+		cfg_stb <= 1'b0;
 		if (rx_done) begin
-			if (rx_pos_q <= 4'd7)
+			if (rx_pos_q <= 4'd7 || (cfg_txn && rx_pos_q <= 4'd11))
 				crc_rx <= crc16_byte(crc_rx, rx_byte_q);
+			// C3 config block (change 6)
+			if (cfg_txn) begin
+				if (rx_pos_q == 4'd10)
+					cfg_b1011[7:0] <= rx_byte_q;
+				if (rx_pos_q == 4'd11)
+					cfg_b1011[15:8] <= rx_byte_q;
+				if (rx_pos_q == 4'd12)
+					cfg_crc_hi <= (rx_byte_q == crc_rx[15:8]);
+				if (rx_pos_q == 4'd13 && cfg_valid) begin
+					cfg_gen  <= sh_gen;
+					cfg_mode <= sh_mode[1:0];
+					cfg_spi  <= sh_spi[2:0];
+					cfg_div0 <= sh_div0;
+					cfg_div1 <= sh_div1;
+					cfg_div2 <= sh_div2;
+					cfg_div3 <= sh_div3;
+					cfg_stb  <= 1'b1;
+				end
+			end
 			case (rx_pos_q)
-				4'd0: magic_ok     <= (rx_byte_q == CTRL_MAGIC);
+				4'd0: begin
+					magic_ok <= (rx_byte_q == CTRL_MAGIC);
+					cfg_txn  <= (rx_byte_q == CFG_MAGIC);
+				end
 				4'd1: c_ack[7:0]   <= rx_byte_q;
 				4'd2: c_ack[15:8]  <= rx_byte_q;
 				4'd3: c_ack[23:16] <= rx_byte_q;
@@ -445,7 +542,8 @@ module spi_frame_link #(
 				4'd8: c_crc[15:8]  <= rx_byte_q;
 				4'd9: begin
 					c_crc[7:0] <= rx_byte_q;
-					dec        <= DEC_CHECK;
+					if (!cfg_txn)              // a C3 transaction never decides a frame
+						dec <= DEC_CHECK;
 				end
 				default: ;
 			endcase
@@ -538,6 +636,7 @@ module spi_frame_link #(
 			rx_pos     <= 4'd0;
 			crc_rx     <= 16'hFFFF;
 			magic_ok   <= 1'b0;
+			cfg_txn    <= 1'b0;
 			dec        <= DEC_IDLE;
 			hdr_ready  <= 1'b0;
 			crc_pos    <= HDR_LEN;
